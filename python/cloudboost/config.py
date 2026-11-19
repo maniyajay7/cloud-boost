@@ -74,6 +74,8 @@ class UploadConfig:
     rclone_buffer_size: str = "256M"  # rclone --buffer-size flag
     rclone_drive_chunk: str = "64M"   # rclone --drive-chunk-size
     dedup: bool = True                # skip unchanged files
+    tps_limit: int = 10               # rclone --tpslimit (Google API TPS)
+    max_transfer: int = 0             # 0 = unlimited (bytes, for quota safety)
     log_file: str = ""
     verbose: bool = False
 
@@ -106,21 +108,27 @@ class UploadConfig:
             config.threads = 4
             config.chunk_size = 4 * MB
             config.compression_level = 6
+            config.rclone_transfers = 4
+            config.rclone_drive_chunk = "64M"
         elif file_size < 1 * GB:
             config.threads = 6
             config.chunk_size = 8 * MB
             config.compression_level = 6
+            config.rclone_transfers = 6
+            config.rclone_drive_chunk = "128M"
         elif file_size < 10 * GB:
             config.threads = 8
             config.chunk_size = 16 * MB
             config.compression_level = 4
-            config.rclone_transfers = 12
+            config.rclone_transfers = 8
+            config.rclone_drive_chunk = "128M"
         else:
             config.threads = 12
             config.chunk_size = 32 * MB
             config.compression_level = 2  # speed over ratio
-            config.rclone_transfers = 16
-            config.rclone_drive_chunk = "128M"
+            config.rclone_transfers = 8
+            config.rclone_drive_chunk = "256M"
+            config.tps_limit = 10
 
         # Apply user overrides last — user always wins
         for key, val in overrides.items():

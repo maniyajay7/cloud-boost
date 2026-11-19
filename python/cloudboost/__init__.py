@@ -1,5 +1,2 @@
-"""
-cloud-boost — Python package init v2
-"""
-__version__ = "2.0.0"
-__author__ = "Jay Maniya"
+"""cloud-boost v3.0.0 — supercharge your cloud uploads"""
+__version__ = "3.0.0"

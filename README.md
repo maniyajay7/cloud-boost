@@ -1,226 +1,312 @@
-# ⚡ cloud-boost v2
+# ⚡ cloud-boost v3
 
-> Production-grade cloud upload accelerator. Parallel chunks, streaming compression, SHA-256 integrity, resume support — handles 100GB+ files. Works with Google Drive, S3, Azure, Dropbox via rclone.
+**Supercharge your cloud uploads.** Entropy-aware compression, quota-safe, auto-tuned rclone pipeline for uploading massive files (100GB–250GB+) to Google Drive.
 
----
-
-## 🚀 Why cloud-boost?
-
-Default cloud uploads are painfully slow because they:
-- Upload one chunk at a time (zero parallelism)
-- Send raw uncompressed data
-- Restart from zero on any failure
-- Use single TCP connections
-- No integrity verification
-
-**cloud-boost fixes all of that.**
+Built for game folders, ISOs, backups — anything huge that needs to get to the cloud fast and reliably.
 
 ---
 
-## ⚙️ Architecture
+## What This Does
 
-```
-                          ┌──────────────┐
-                          │  Source File  │
-                          └──────┬───────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │  Auto-Tune Engine       │
-                    │  (adapts to file size)  │
-                    └────────────┬────────────┘
-                                 │
-              ┌──────────────────┼──────────────────┐
-              │                  │                   │
-         < 50MB             50MB – 10GB           > 10GB
-         Direct             6-8 threads          12 threads
-         rclone             8MB chunks           32MB chunks
-         upload             Level 6 gzip         Level 2 gzip
-              │                  │                   │
-              └──────────┬───────┘                   │
-                         │                           │
-                ┌────────▼─────────┐                 │
-                │ Streaming Pipeline│◄────────────────┘
-                │                  │
-                │  Read chunk      │
-                │  ↓ (in memory)   │
-                │  Compress chunk  │
-                │  ↓ (in memory)   │
-                │  Write temp .gz  │
-                │  ↓               │
-                │  Upload rclone   │  × N threads parallel
-                │  ↓               │
-                │  Delete temp     │
-                │  ↓               │
-                │  Save checkpoint │
-                └──────────────────┘
-                         │
-                ┌────────▼─────────┐
-                │  SHA-256 Verify  │
-                │  + Manifest Save │
-                └──────────────────┘
+cloud-boost sits between you and Google Drive. Instead of dragging a 200GB game folder into Google Drive (which will choke, timeout, and lose progress), you run one command:
+
+```bash
+cloudboost upload "D:\Games\Elden Ring" gdrive:/games/
 ```
 
+**What happens under the hood:**
+1. **Scans** every file for compressibility (magic bytes + entropy analysis)
+2. **Skips** compression on already-compressed files (.zip, .pak, .mp4, etc.)
+3. **Compresses** only what benefits from it (saves bandwidth + time)
+4. **Uploads** via rclone with optimized flags (auto-tuned chunk sizes, transfer counts, rate limits)
+5. **Tracks** Google Drive's 750GB/day quota so you don't get randomly blocked
+6. **Resumes** interrupted uploads — no re-uploading what already finished
+
 ---
 
-## 📦 Install
+## Requirements
 
-### Python CLI
+Before using cloud-boost, you need:
+
+| Requirement | Why | Install |
+|------------|-----|---------|
+| **rclone** | The actual upload engine | [rclone.org/install](https://rclone.org/install/) |
+| **rclone Google Drive remote** | So rclone knows your Drive account | `rclone config` → follow prompts |
+| **Node.js 18+** (for Node CLI) | Runtime | [nodejs.org](https://nodejs.org/) |
+| **Python 3.8+** (for Python CLI) | Runtime | [python.org](https://python.org/) |
+
+> You only need **one** of Node.js or Python — pick whichever you prefer.
+
+---
+
+## Installation
+
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/YOUR_USERNAME/cloud-boost.git
+cd cloud-boost
+```
+
+### 2a. Node.js Setup
+
+```bash
+cd node
+npm install
+```
+
+To make `cloudboost` available as a global command:
+```bash
+npm link
+```
+
+Now you can run `cloudboost` from anywhere in your terminal.
+
+### 2b. Python Setup
+
 ```bash
 cd python
 pip install -e .
 ```
 
-### Node.js CLI
+For faster compression (5-10x speed boost):
 ```bash
-cd node
-npm install
-npm link
+pip install -e ".[fast]"
 ```
 
-### Prerequisites
-- **rclone** — [Install rclone](https://rclone.org/install/)
-- Configure your remote: `rclone config`
+This installs `zstandard` (zstd) — without it, cloud-boost falls back to gzip which is slower but still works.
 
 ---
 
-## ⚡ Usage
+## Quick Start
+
+### Step 1: Verify setup
 
 ```bash
-# Upload a file (auto-tunes everything)
-cloudboost upload myfile.zip gdrive:/backup/
-
-# Upload a folder (recursive)
-cloudboost upload ./project gdrive:/projects/
-
-# Custom threads & chunk size
-cloudboost upload big.iso gdrive:/iso/ --threads 8 --chunk-size 32MB
-
-# Bandwidth limiting
-cloudboost upload data.tar gdrive:/data/ --max-bw 50MB
-
-# Resume interrupted upload
-cloudboost resume big.iso gdrive:/iso/
-
-# Check setup
 cloudboost doctor
-
-# Show remotes
-cloudboost stats
-
-# Initialize config
-cloudboost init
 ```
 
----
+This checks:
+- ✓ rclone installed
+- ✓ Google Drive remote configured
+- ✓ Custom OAuth Client ID (optional but 5-10x faster)
+- ✓ Compression engine available
 
-## 🧠 Auto-Tune Engine
+### Step 2: Upload a file
 
-You don't need to configure anything. cloud-boost automatically adapts based on file size:
-
-| File Size | Threads | Chunk Size | Compression | rclone Transfers |
-|---|---|---|---|---|
-| < 50 MB | Direct upload | — | — | — |
-| < 100 MB | 4 | 4 MB | Level 6 | 8 |
-| < 1 GB | 6 | 8 MB | Level 6 | 8 |
-| < 10 GB | 8 | 16 MB | Level 4 | 12 |
-| > 10 GB | 12 | 32 MB | Level 2 | 16 |
-
-Override any setting via CLI flags — your values always win.
-
----
-
-## 🔄 Resume System
-
-Every chunk upload is checkpointed via a **manifest file** in `~/.cloudboost/checkpoints/`.
-
-If your upload fails (network drop, power outage, Ctrl+C):
 ```bash
-cloudboost resume myfile.zip gdrive:/backup/
-# Picks up exactly where it left off — zero wasted bandwidth
+cloudboost upload myfile.zip gdrive:/backup/
 ```
 
-The manifest tracks:
-- Source file SHA-256 hash (detects file changes)
-- Per-chunk hash (dedup — skips unchanged chunks)
-- Upload status per chunk
-- Compression metadata
+### Step 3: Upload a folder (the real use case)
+
+```bash
+cloudboost upload "D:\Games\Cyberpunk 2077" gdrive:/games/
+```
+
+That's it. cloud-boost handles everything automatically.
 
 ---
 
-## 🛡️ Features
+## Commands
 
-| Feature | Description |
-|---|---|
-| **Streaming pipeline** | Never writes raw chunks to disk — only compressed temps |
-| **Parallel upload** | 4-12 threads auto-tuned to file size |
-| **gzip compression** | Level auto-tuned: fast (2) for huge files, balanced (6) for normal |
-| **SHA-256 integrity** | Every chunk verified, source file hashed |
-| **Resume on failure** | Manifest-based checkpoint system |
-| **Deduplication** | Hash-based skip for unchanged chunks |
-| **Auto-tuning** | Zero config needed — adapts to file size |
-| **Exponential backoff** | Smart retry with 2^n delay |
-| **Bandwidth throttle** | `--max-bw` flag to cap upload speed |
-| **Sub-folder chunking** | Chunks stored in hex sub-dirs (256 max per folder) |
-| **Small file fast path** | Files < 50MB skip chunking entirely |
-| **Folder upload** | Recursive with per-file manifests |
-| **Diagnostics** | `cloudboost doctor` checks everything |
+| Command | What it does |
+|---------|-------------|
+| `cloudboost upload <source> <dest>` | Upload file or folder to cloud |
+| `cloudboost resume` | Show and resume interrupted uploads |
+| `cloudboost doctor` | Diagnose your setup |
+| `cloudboost setup` | Guide to create custom OAuth Client ID (5-10x faster) |
+| `cloudboost stats` | Show configured remotes and compressor |
+| `cloudboost init` | Initialize config at `~/.cloudboost/` |
+
+### Upload Options
+
+```bash
+cloudboost upload <source> <destination> [options]
+
+Options:
+  -t, --threads <n>        Upload thread count (auto-tuned by default)
+  --no-compress            Skip compression entirely
+  --no-dedup               Don't skip already-uploaded files
+  --max-bw <size>          Bandwidth limit (e.g. "50MB")
+  --max-transfer <size>    Max bytes to upload (e.g. "700GB" for quota safety)
+  -p, --provider <name>    Cloud provider (default: "gdrive")
+  -v, --verbose            Verbose output
+```
+
+### Examples
+
+```bash
+# Upload a single file
+cloudboost upload backup.tar.gz gdrive:/backups/
+
+# Upload a 200GB game folder
+cloudboost upload "D:\Games\GTA V" gdrive:/games/
+
+# Upload with bandwidth limit (don't hog internet)
+cloudboost upload ./data gdrive:/data/ --max-bw 50MB
+
+# Upload with quota safety (stop before hitting 750GB daily limit)
+cloudboost upload ./huge-backup gdrive:/backup/ --max-transfer 700GB
+
+# Skip compression for already-compressed archives
+cloudboost upload ./zips gdrive:/archives/ --no-compress
+
+# See what's interrupted and can be resumed
+cloudboost resume
+```
 
 ---
 
-## 🌐 Supported Providers (via rclone)
+## How It Works
 
-- ☁️ Google Drive
-- 🟠 AWS S3
-- 🔵 Azure Blob Storage
-- 📦 Dropbox
-- 🌊 DigitalOcean Spaces
-- 🟩 Supabase Storage
-- 🗂️ Any rclone-supported backend (40+ providers)
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                   cloud-boost CLI                     │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  ┌─────────┐   ┌────────────┐   ┌────────────────┐  │
+│  │ Entropy  │──▶│ Compressor │──▶│   Transport    │  │
+│  │ Analyzer │   │ (zstd/gz)  │   │ (rclone exec)  │  │
+│  └─────────┘   └────────────┘   └────────────────┘  │
+│       │                               │              │
+│  ┌─────────┐                    ┌─────────────┐      │
+│  │ Config  │                    │  Manifest   │      │
+│  │AutoTune │                    │  (resume)   │      │
+│  └─────────┘                    └─────────────┘      │
+│                                       │              │
+│                                 ┌─────────────┐      │
+│                                 │   Quota     │      │
+│                                 │  Tracker    │      │
+│                                 └─────────────┘      │
+└──────────────────────────────────────────────────────┘
+                        │
+                   rclone copyto / copy
+                        │
+                  ┌─────────────┐
+                  │ Google Drive│
+                  │   (API)     │
+                  └─────────────┘
+```
+
+### Upload Strategy (Two-Tier)
+
+| File Size | Strategy |
+|-----------|----------|
+| **< 50MB** | Direct rclone upload — no processing overhead |
+| **50MB+** | Entropy analysis → smart compression → optimized rclone upload |
+| **Folder** | Scan all files → compress compressible ones into staging dir → single `rclone copy` |
+
+### Entropy Detection (Why We Don't Compress Everything)
+
+Most game files (.pak, .zip, .mp4, .wem) are **already compressed**. Trying to gzip a .pak file makes it **bigger**, wastes CPU, and wastes time.
+
+cloud-boost uses a 3-phase detection pipeline:
+
+1. **Magic bytes** — Read first 16 bytes, match against 25+ known compressed format signatures (O(1))
+2. **Extension check** — Match against 50+ known compressed extensions (O(1))
+3. **Shannon entropy sampling** — Sample head + middle + end of file, compute entropy score:
+   - Entropy > 7.2 → Already compressed → **skip**
+   - Entropy < 6.0 → Highly compressible → **compress aggressively**
+   - 6.0–7.2 → Maybe compressible → **compress with fast level, verify 5% savings**
+
+### Google Drive Quota Awareness
+
+Google Drive has a **750GB/day upload limit** per user. cloud-boost tracks cumulative uploads and:
+- **Warns** at 93% usage (697GB)
+- **Blocks** at 100% with a clear message instead of letting you hit a cryptic 403
 
 ---
 
-## 📁 Project Structure
+## Speed Optimization: Custom OAuth Client ID
+
+The **single biggest speed improvement** you can make. By default, rclone uses a shared client ID that thousands of people share — Google throttles it heavily.
+
+Run `cloudboost setup` to get a step-by-step guide for creating your own. Result: **5-10x faster uploads**.
+
+---
+
+## Configuration
+
+Config is stored at `~/.cloudboost/config.json`. Created automatically on first run.
+
+```json
+{
+  "threads": 6,
+  "chunkSize": "8MB",
+  "compression": true,
+  "compressionLevel": 6,
+  "resume": true,
+  "provider": "gdrive",
+  "maxBandwidth": 0,
+  "maxRetries": 3,
+  "checksumVerify": true,
+  "dedup": true,
+  "verbose": false
+}
+```
+
+The auto-tune engine overrides these defaults based on what you're uploading:
+- Small files (<100MB): 4 transfers, 64M chunks
+- Medium files (<1GB): 6 transfers, 128M chunks
+- Large files (<10GB): 8 transfers, 128M chunks
+- Huge files (10GB+): 8 transfers, 256M chunks, lower compression
+
+---
+
+## If You Already Have rclone Mounted (like Z: drive)
+
+If you're already using `rclone mount gdrive: Z:` — you're using rclone to **mount** Google Drive as a local drive. That works for browsing files, but it's **slow for large uploads** because every file write goes through FUSE.
+
+cloud-boost uses `rclone copy` / `rclone copyto` directly — this is **much faster** because:
+- No FUSE overhead
+- Optimized chunk sizes (128M-256M vs default 8M)
+- Parallel transfers (8 simultaneous)
+- Rate limit awareness (no random 403s)
+
+**You can use both.** Keep your Z: mount for browsing, use cloud-boost for uploading big stuff.
+
+---
+
+## Project Structure
 
 ```
 cloud-boost/
-├── README.md
-├── .gitignore
-├── docs/
-├── python/
+├── node/                      # Node.js implementation
+│   ├── package.json
+│   └── src/
+│       ├── cli.js             # CLI commands (upload, resume, doctor, setup, stats, init)
+│       ├── config.js          # Configuration + auto-tune engine
+│       ├── entropy.js         # Magic bytes + Shannon entropy detection
+│       ├── compressor.js      # zstd/gzip streaming compression
+│       ├── manifest.js        # File-level upload tracking + resume
+│       ├── transport.js       # rclone wrapper + quota tracker
+│       ├── index.js           # Core uploader (two-tier strategy)
+│       └── setup-wizard.js    # OAuth Client ID setup guide
+├── python/                    # Python implementation
 │   ├── setup.py
 │   ├── requirements.txt
 │   └── cloudboost/
-│       ├── __init__.py
-│       ├── config.py        ← auto-tune engine
-│       ├── integrity.py     ← SHA-256, manifests, dedup
-│       ├── transport.py     ← rclone subprocess, retries
-│       ├── logger.py        ← structured JSON logging
-│       ├── uploader.py      ← core streaming pipeline
-│       └── cli.py           ← Click CLI
-└── node/
-    ├── package.json
-    └── src/
-        ├── config.js        ← auto-tune engine
-        ├── integrity.js     ← SHA-256, manifests, dedup
-        ├── transport.js     ← rclone subprocess, retries
-        ├── index.js         ← core streaming pipeline
-        └── cli.js           ← Commander CLI
+│       ├── cli.py             # CLI commands
+│       ├── config.py          # Configuration + auto-tune
+│       ├── entropy.py         # Magic bytes + Shannon entropy
+│       ├── compressor.py      # zstd/gzip compression
+│       ├── manifest.py        # Upload tracking + resume
+│       ├── transport.py       # rclone wrapper + quota tracker
+│       ├── uploader.py        # Core uploader
+│       ├── setup_wizard.py    # OAuth setup guide
+│       └── logger.py          # Structured JSON logging
+├── docs/                      # Documentation
+├── README.md                  # This file
+└── .gitignore
 ```
 
----
-
-## 📊 Performance Estimates
-
-| Upload Speed | 1 GB (no boost) | 1 GB (cloud-boost) | 100 GB (cloud-boost) |
-|---|---|---|---|
-| 10 Mbps | ~14 min | ~3 min | ~5 hours |
-| 50 Mbps | ~3 min | ~40 sec | ~1 hour |
-| 100 Mbps | ~90 sec | ~20 sec | ~30 min |
-
-*Actual results depend on file compressibility and cloud provider limits.*
+Both implementations (Node.js and Python) are **functionally identical** — same architecture, same features, same rclone flags. Use whichever runtime you prefer.
 
 ---
 
-## 📄 License
+## License
 
-MIT © Jay Maniya
+MIT — do whatever you want with it.

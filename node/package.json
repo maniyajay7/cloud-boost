@@ -1,26 +1,29 @@
 {
   "name": "cloud-boost",
-  "version": "2.0.0",
-  "description": "Supercharge your cloud uploads with parallel chunking, compression, and resume support",
+  "version": "3.0.0",
+  "description": "Supercharge your cloud uploads — entropy-aware compression, quota-safe, auto-tuned rclone pipeline",
+  "type": "module",
   "main": "src/index.js",
   "bin": {
     "cloudboost": "src/cli.js"
   },
   "scripts": {
     "start": "node src/cli.js",
-    "test": "jest",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "doctor": "node src/cli.js doctor"
   },
-  "keywords": ["cloud", "upload", "rclone", "gdrive", "parallel", "fast", "resume", "chunked"],
+  "keywords": [
+    "cloud", "upload", "rclone", "gdrive", "parallel", "fast",
+    "resume", "compression", "zstd", "entropy", "quota"
+  ],
   "author": "Jay Maniya",
   "license": "MIT",
   "dependencies": {
     "chalk": "^5.3.0",
-    "cli-progress": "^3.12.0",
-    "commander": "^11.0.0",
-    "fs-extra": "^11.1.1",
-    "p-limit": "^5.0.0",
-    "which": "^4.0.0"
+    "commander": "^11.0.0"
+  },
+  "optionalDependencies": {
+    "@aspect-build/zstd": "^0.1.0"
   },
   "devDependencies": {
     "jest": "^29.0.0"

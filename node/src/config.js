@@ -1,44 +1,54 @@
 /**
- * cloud-boost config (Node.js)
- * Handles: auto-tuning, validation, defaults
+ * cloud-boost v3 — configuration manager
+ * Handles: loading, validation, defaults, user overrides, auto-tune engine
  */
 
-'use strict';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
-const os = require('os');
-const path = require('path');
-const fs = require('fs-extra');
+// ─── Size Constants ──────────────────────────────────────────────────────────
+export const KB = 1024;
+export const MB = 1024 * KB;
+export const GB = 1024 * MB;
 
-const KB = 1024;
-const MB = 1024 * KB;
-const GB = 1024 * MB;
+// ─── Directories ─────────────────────────────────────────────────────────────
+export const CONFIG_DIR = path.join(os.homedir(), '.cloudboost');
+export const CHECKPOINTS_DIR = path.join(CONFIG_DIR, 'checkpoints');
+export const LOGS_DIR = path.join(CONFIG_DIR, 'logs');
+export const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
-const CONFIG_DIR = path.join(os.homedir(), '.cloudboost');
-const CONFIG_FILE = path.join(CONFIG_DIR, 'config.yml');
-const CHECKPOINTS_DIR = path.join(CONFIG_DIR, 'checkpoints');
-const LOGS_DIR = path.join(CONFIG_DIR, 'logs');
+// ─── Supported Providers ─────────────────────────────────────────────────────
+export const PROVIDERS = ['gdrive', 's3', 'azure', 'dropbox', 'spaces', 'supabase'];
 
-const PROVIDERS = ['gdrive', 's3', 'azure', 'dropbox', 'spaces', 'supabase'];
-
-function parseSize(sizeStr) {
-  const str = sizeStr.toString().trim().toUpperCase();
+/**
+ * Parse human-readable size string to bytes. e.g. '5MB' → 5242880
+ */
+export function parseSize(sizeStr) {
+  const str = sizeStr.trim().toUpperCase();
   const multipliers = { GB, MB, KB, B: 1 };
   for (const [suffix, mult] of Object.entries(multipliers)) {
     if (str.endsWith(suffix)) {
-      return Math.floor(parseFloat(str.slice(0, -suffix.length)) * mult);
+      return Math.floor(parseFloat(str.slice(0, -suffix.length).trim()) * mult);
     }
   }
-  return parseInt(str);
+  return parseInt(str, 10);
 }
 
-function formatSize(bytes) {
-  if (bytes >= GB) return `${(bytes / GB).toFixed(2)} GB`;
-  if (bytes >= MB) return `${(bytes / MB).toFixed(2)} MB`;
-  if (bytes >= KB) return `${(bytes / KB).toFixed(2)} KB`;
-  return `${bytes} B`;
+/**
+ * Format bytes to human-readable string.
+ */
+export function formatSize(sizeBytes) {
+  if (sizeBytes >= GB) return `${(sizeBytes / GB).toFixed(2)} GB`;
+  if (sizeBytes >= MB) return `${(sizeBytes / MB).toFixed(2)} MB`;
+  if (sizeBytes >= KB) return `${(sizeBytes / KB).toFixed(2)} KB`;
+  return `${sizeBytes} B`;
 }
 
-function formatDuration(seconds) {
+/**
+ * Format seconds to human-readable duration.
+ */
+export function formatDuration(seconds) {
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
   if (seconds < 3600) {
     const mins = Math.floor(seconds / 60);
@@ -50,70 +60,150 @@ function formatDuration(seconds) {
   return `${hours}h ${mins}m`;
 }
 
-function defaultConfig() {
-  return {
-    threads: 6,
-    chunkSize: 8 * MB,
-    compression: true,
-    compressionLevel: 6,
-    resume: true,
-    provider: 'gdrive',
-    maxBandwidth: 0,
-    maxRetries: 3,
-    retryDelay: 2.0,
-    checksumVerify: true,
-    rcloneTransfers: 8,
-    rcloneBufferSize: '256M',
-    rcloneDriveChunk: '64M',
-    dedup: true,
-    verbose: false,
-  };
-}
+/**
+ * Upload configuration with validated defaults.
+ */
+export class UploadConfig {
+  constructor(opts = {}) {
+    this.threads = opts.threads ?? 6;
+    this.chunkSize = opts.chunkSize ?? 8 * MB;
+    this.compression = opts.compression ?? true;
+    this.compressionLevel = opts.compressionLevel ?? 6;
+    this.resume = opts.resume ?? true;
+    this.provider = opts.provider ?? 'gdrive';
+    this.maxBandwidth = opts.maxBandwidth ?? 0;
+    this.maxRetries = opts.maxRetries ?? 3;
+    this.retryDelay = opts.retryDelay ?? 2.0;
+    this.checksumVerify = opts.checksumVerify ?? true;
+    this.rcloneTransfers = opts.rcloneTransfers ?? 8;
+    this.rcloneBufferSize = opts.rcloneBufferSize ?? '256M';
+    this.rcloneDriveChunk = opts.rcloneDriveChunk ?? '64M';
+    this.dedup = opts.dedup ?? true;
+    this.tpsLimit = opts.tpsLimit ?? 10;
+    this.maxTransfer = opts.maxTransfer ?? 0;
+    this.logFile = opts.logFile ?? '';
+    this.verbose = opts.verbose ?? false;
 
-function autoTune(fileSize, overrides = {}) {
-  const config = defaultConfig();
-
-  if (fileSize < 100 * MB) {
-    config.threads = 4;
-    config.chunkSize = 4 * MB;
-    config.compressionLevel = 6;
-  } else if (fileSize < 1 * GB) {
-    config.threads = 6;
-    config.chunkSize = 8 * MB;
-    config.compressionLevel = 6;
-  } else if (fileSize < 10 * GB) {
-    config.threads = 8;
-    config.chunkSize = 16 * MB;
-    config.compressionLevel = 4;
-    config.rcloneTransfers = 12;
-  } else {
-    config.threads = 12;
-    config.chunkSize = 32 * MB;
-    config.compressionLevel = 2;
-    config.rcloneTransfers = 16;
-    config.rcloneDriveChunk = '128M';
+    this._validate();
   }
 
-  // User overrides always win
-  for (const [key, val] of Object.entries(overrides)) {
-    if (val !== undefined && val !== null && key in config) {
-      config[key] = val;
+  _validate() {
+    if (this.threads < 1 || this.threads > 32) {
+      throw new Error(`Threads must be 1-32, got ${this.threads}`);
+    }
+    if (this.chunkSize < 1 * MB) {
+      throw new Error(`Chunk size must be >= 1MB, got ${formatSize(this.chunkSize)}`);
+    }
+    if (this.chunkSize > 512 * MB) {
+      throw new Error(`Chunk size must be <= 512MB, got ${formatSize(this.chunkSize)}`);
+    }
+    if (this.compressionLevel < 1 || this.compressionLevel > 9) {
+      throw new Error(`Compression level must be 1-9, got ${this.compressionLevel}`);
+    }
+    if (this.maxRetries < 0 || this.maxRetries > 10) {
+      throw new Error(`Max retries must be 0-10, got ${this.maxRetries}`);
+    }
+    if (!PROVIDERS.includes(this.provider)) {
+      throw new Error(`Provider must be one of [${PROVIDERS.join(', ')}], got ${this.provider}`);
     }
   }
 
-  return config;
+  /**
+   * Auto-tune configuration based on file size.
+   * Small (<100MB), Medium (<1GB), Large (<10GB), Huge (10GB+)
+   */
+  static autoTune(fileSize, overrides = {}) {
+    const opts = {};
+
+    if (fileSize < 100 * MB) {
+      Object.assign(opts, {
+        threads: 4,
+        chunkSize: 4 * MB,
+        compressionLevel: 6,
+        rcloneTransfers: 4,
+        rcloneDriveChunk: '64M',
+      });
+    } else if (fileSize < 1 * GB) {
+      Object.assign(opts, {
+        threads: 6,
+        chunkSize: 8 * MB,
+        compressionLevel: 6,
+        rcloneTransfers: 6,
+        rcloneDriveChunk: '128M',
+      });
+    } else if (fileSize < 10 * GB) {
+      Object.assign(opts, {
+        threads: 8,
+        chunkSize: 16 * MB,
+        compressionLevel: 4,
+        rcloneTransfers: 8,
+        rcloneDriveChunk: '128M',
+      });
+    } else {
+      Object.assign(opts, {
+        threads: 12,
+        chunkSize: 32 * MB,
+        compressionLevel: 2,
+        rcloneTransfers: 8,
+        rcloneDriveChunk: '256M',
+        tpsLimit: 10,
+      });
+    }
+
+    // User overrides always win
+    for (const [key, val] of Object.entries(overrides)) {
+      if (val !== undefined && val !== null) {
+        opts[key] = val;
+      }
+    }
+
+    return new UploadConfig(opts);
+  }
 }
 
-async function ensureDirs() {
-  await fs.ensureDir(CONFIG_DIR);
-  await fs.ensureDir(CHECKPOINTS_DIR);
-  await fs.ensureDir(LOGS_DIR);
+/**
+ * Create required directories if they don't exist.
+ */
+export function ensureDirs() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.mkdirSync(CHECKPOINTS_DIR, { recursive: true });
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
 }
 
-module.exports = {
-  KB, MB, GB,
-  CONFIG_DIR, CONFIG_FILE, CHECKPOINTS_DIR, LOGS_DIR,
-  PROVIDERS,
-  parseSize, formatSize, formatDuration,
-  defaultConfig, autoTune, ensureDirs,
-};
+/**
+ * Load user config from ~/.cloudboost/config.json
+ */
+export function loadConfig() {
+  ensureDirs();
+  if (fs.existsSync(CONFIG_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+/**
+ * Write default config file if it doesn't exist.
+ */
+export function saveDefaultConfig() {
+  ensureDirs();
+  if (!fs.existsSync(CONFIG_FILE)) {
+    const defaults = {
+      threads: 6,
+      chunkSize: '8MB',
+      compression: true,
+      compressionLevel: 6,
+      resume: true,
+      provider: 'gdrive',
+      maxBandwidth: 0,
+      maxRetries: 3,
+      checksumVerify: true,
+      dedup: true,
+      verbose: false,
+    };
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaults, null, 2));
+  }
+}

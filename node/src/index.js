@@ -1,356 +1,429 @@
 /**
- * cloud-boost core uploader v2 (Node.js)
- * Production-grade: streaming pipeline, 100GB+ support, integrity verification
+ * cloud-boost v3 — core uploader (REWRITTEN)
+ * Two-tier upload strategy with smart compression and single-rclone-call architecture.
+ *
+ * Strategy:
+ *   < 50MB:   Direct rclone upload (no processing)
+ *   50MB+:    Entropy analysis → optional compression → rclone upload with optimized flags
+ *   Folder:   Pre-process compressible files → single rclone copy with --transfers
+ *   250GB+:   Same as above, rclone handles its own chunking natively
  */
 
-'use strict';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import chalk from 'chalk';
+import {
+  UploadConfig,
+  formatSize,
+  formatDuration,
+  MB,
+  GB,
+  ensureDirs,
+} from './config.js';
+import { analyzeFile } from './entropy.js';
+import { compressFile, getCompressorName, getCompressionExt } from './compressor.js';
+import {
+  checkRcloneInstalled,
+  getRcloneRemotes,
+  uploadFileRclone,
+  uploadFolderRclone,
+  uploadWithProgress,
+  QuotaTracker,
+} from './transport.js';
+import {
+  createManifest,
+  loadManifest,
+  saveManifest,
+  markUploading,
+  markCompleted,
+  markFailed,
+  markCompressed,
+  isAlreadyUploaded,
+} from './manifest.js';
 
-const fs = require('fs-extra');
-const path = require('path');
-const zlib = require('zlib');
-const os = require('os');
-const cliProgress = require('cli-progress');
-
-const { autoTune, formatSize, formatDuration, MB, GB, ensureDirs } = require('./config');
-const {
-  computeSha256, computeChunkHash,
-  loadManifest, saveManifest, clearManifest,
-  isChunkUploaded, markChunkUploaded,
-} = require('./integrity');
-const {
-  checkRcloneInstalled, getRcloneRemotes,
-  uploadChunk: rcloneUploadChunk, uploadDirectRclone,
-} = require('./transport');
+const SEPARATOR = '═'.repeat(60);
 
 /**
- * Stream-read a chunk from file at offset, compress in memory.
- * NEVER writes raw chunk to disk — only compressed result touches disk.
+ * Recursively collect all files in a directory.
  */
-async function streamCompressChunk(filepath, offset, size, level) {
-  const fd = await fs.open(filepath, 'r');
-  const buffer = Buffer.alloc(size);
-  const { bytesRead } = await fs.read(fd, buffer, 0, size, offset);
-  await fs.close(fd);
-
-  const rawData = buffer.slice(0, bytesRead);
-  const rawHash = computeChunkHash(rawData);
-
-  const compressed = await new Promise((resolve, reject) => {
-    zlib.gzip(rawData, { level }, (err, result) => {
-      if (err) reject(err);
-      else resolve(result);
-    });
-  });
-
-  return { compressed, rawHash };
+function collectFiles(dir) {
+  const results = [];
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isFile()) {
+      results.push(fullPath);
+    } else if (entry.isDirectory()) {
+      results.push(...collectFiles(fullPath));
+    }
+  }
+  return results.sort();
 }
 
 /**
- * Process a single chunk: read → compress → write temp → upload → delete temp.
+ * Copy a file, creating parent directories as needed.
  */
-async function processAndUploadChunk(
-  filepath, chunkIndex, offset, chunkSize, destination, config, manifest
-) {
-  const result = {
-    chunkIndex,
-    success: false,
-    skipped: false,
-    rawSize: chunkSize,
-    compressedSize: 0,
-    uploadTime: 0,
-  };
+function copyFile(src, dst) {
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.copyFileSync(src, dst);
+}
 
-  const tempPath = path.join(os.tmpdir(), `cb_${String(chunkIndex).padStart(6, '0')}.gz`);
+/**
+ * Print the upload banner with file info and config.
+ */
+function printHeader(filepath, destination, config, fileSize) {
+  console.log(`\n${chalk.cyan(SEPARATOR)}`);
+  console.log(`${chalk.cyan('  ⚡ cloud-boost v3 — Production Upload Engine')}`);
+  console.log(`${chalk.cyan(SEPARATOR)}`);
+  console.log(`  File       : ${path.basename(filepath)}`);
+  console.log(`  Size       : ${formatSize(fileSize)}`);
+  console.log(`  Target     : ${destination}`);
+  console.log(`  Provider   : ${config.provider}`);
+  console.log(`  Compressor : ${getCompressorName()}`);
+  console.log(`  rclone     : transfers=${config.rcloneTransfers}, chunk=${config.rcloneDriveChunk}, tps=${config.tpsLimit}`);
+  if (config.maxBandwidth > 0) {
+    console.log(`  Bandwidth  : ${formatSize(config.maxBandwidth)}/s cap`);
+  }
+  console.log(`${chalk.cyan(SEPARATOR)}\n`);
+}
 
-  try {
-    // Step 1 — Stream read + compress in memory
-    const { compressed, rawHash } = await streamCompressChunk(
-      filepath, offset, chunkSize, config.compressionLevel
-    );
-    result.compressedSize = compressed.length;
+/**
+ * Print upload result summary.
+ */
+function printSummary(success, filepath, fileSize, elapsed, wasCompressed = false, compressedSize = 0, error = '') {
+  console.log(`\n${chalk.cyan(SEPARATOR)}`);
+  console.log(`${chalk.cyan('  Upload Summary')}`);
+  console.log(`${chalk.cyan(SEPARATOR)}`);
 
-    // Step 2 — Dedup + resume check
-    if (config.dedup && isChunkUploaded(manifest, chunkIndex, rawHash)) {
-      result.success = true;
-      result.skipped = true;
-      return result;
+  if (success) {
+    const speed = elapsed > 0 ? fileSize / elapsed : 0;
+    console.log(`${chalk.green('  Status     : ✓ COMPLETE')}`);
+    console.log(`  File       : ${path.basename(filepath)}`);
+    console.log(`  Size       : ${formatSize(fileSize)}`);
+    if (wasCompressed && compressedSize > 0) {
+      const ratio = ((1 - compressedSize / fileSize) * 100).toFixed(1);
+      console.log(`  Compressed : ${formatSize(compressedSize)} (${ratio}% smaller)`);
     }
-
-    // Step 3 — Write compressed to temp (only compressed touches disk)
-    await fs.writeFile(tempPath, compressed);
-
-    // Step 4 — Upload via rclone
-    const startTime = Date.now();
-    const success = await rcloneUploadChunk(tempPath, destination, chunkIndex, config);
-    result.uploadTime = (Date.now() - startTime) / 1000;
-
-    if (success) {
-      markChunkUploaded(manifest, chunkIndex, rawHash, result.compressedSize);
-      await saveManifest(filepath, manifest);
-      result.success = true;
+    console.log(`  Time       : ${formatDuration(elapsed)}`);
+    console.log(`  Avg Speed  : ${formatSize(Math.floor(speed))}/s`);
+  } else {
+    console.log(`${chalk.red('  Status     : ✗ FAILED')}`);
+    console.log(`  File       : ${path.basename(filepath)}`);
+    if (error) {
+      console.log(`${chalk.red(`  Error      : ${error}`)}`);
     }
-  } catch (err) {
-    result.error = err.message;
-  } finally {
-    // Always clean up temp
-    await fs.remove(tempPath).catch(() => {});
+    console.log(`${chalk.yellow("  → Run 'cloudboost resume' to retry")}`);
   }
 
-  return result;
+  console.log(`${chalk.cyan(SEPARATOR)}\n`);
 }
 
 /**
- * Main upload entry point for a single file.
+ * Upload a single file with smart compression and optimized rclone.
+ *
+ * Pipeline:
+ * 1. Validate inputs
+ * 2. Check if already uploaded (dedup)
+ * 3. Analyze entropy → decide compression
+ * 4. Compress if beneficial (zstd/gzip)
+ * 5. Upload via rclone (single call, optimized flags)
+ * 6. Track quota + save manifest
  */
-async function uploadFile(filepath, destination, config = null) {
-  const chalk = (await import('chalk')).default;
-  const pLimit = (await import('p-limit')).default;
+export async function uploadFile(filepath, destination, config = null, quota = null) {
+  ensureDirs();
 
-  await ensureDirs();
+  // ─── Validate ──────────────────────────────────────────────────────────────
+  filepath = path.resolve(filepath);
 
-  // ─── Validations ─────────────────────────────────────────────────────────
-  if (!(await fs.pathExists(filepath))) {
+  if (!fs.existsSync(filepath)) {
     console.error(chalk.red(`✗ File not found: ${filepath}`));
     return false;
   }
 
-  const stat = await fs.stat(filepath);
-  if (!stat.isFile()) {
-    console.error(chalk.red(`✗ Not a file: ${filepath} (use uploadFolder for directories)`));
+  if (!fs.statSync(filepath).isFile()) {
+    console.error(chalk.red(`✗ Not a file: ${filepath} — use uploadFolder for directories`));
     return false;
   }
 
   if (!checkRcloneInstalled()) {
-    console.error(chalk.red('✗ rclone is not installed. Install from https://rclone.org/install/'));
+    console.error(chalk.red('✗ rclone not installed. Get it from https://rclone.org/install/'));
     return false;
   }
 
-  const fileSize = stat.size;
+  const fileSize = fs.statSync(filepath).size;
   if (fileSize === 0) {
     console.error(chalk.red('✗ File is empty — nothing to upload'));
     return false;
   }
 
-  // ─── Auto-tune config ────────────────────────────────────────────────────
-  if (!config) {
-    config = autoTune(fileSize);
+  // ─── Auto-tune config ──────────────────────────────────────────────────────
+  if (config === null) {
+    config = UploadConfig.autoTune(fileSize);
   }
 
-  // ─── Small file fast path ────────────────────────────────────────────────
+  // ─── Dedup check ───────────────────────────────────────────────────────────
+  if (config.dedup && isAlreadyUploaded(filepath, destination)) {
+    console.log(chalk.green(`→ Already uploaded: ${path.basename(filepath)} → skipping`));
+    return true;
+  }
+
+  // ─── Print header ──────────────────────────────────────────────────────────
+  printHeader(filepath, destination, config, fileSize);
+
+  // ─── Create manifest ───────────────────────────────────────────────────────
+  const manifest = createManifest(filepath);
+  markUploading(filepath, manifest, destination);
+
+  // ─── Quota check ───────────────────────────────────────────────────────────
+  if (quota === null) {
+    quota = new QuotaTracker(config.provider);
+  }
+
+  const quotaStatus = quota.check();
+  if (quotaStatus === 'blocked') {
+    console.error(chalk.red('✗ Daily upload quota (750GB) reached. Try again tomorrow.'));
+    markFailed(filepath, manifest, 'Quota exceeded');
+    return false;
+  }
+  if (quotaStatus === 'warning') {
+    console.log(chalk.yellow(`  ⚠ Approaching daily quota — ${formatSize(quota.remaining())} left`));
+  }
+
+  // ─── Small file fast path (< 50MB) ─────────────────────────────────────────
   if (fileSize < 50 * MB) {
-    console.log(chalk.cyan(`\n→ Small file (${formatSize(fileSize)}) — direct rclone upload`));
-    const start = Date.now();
-    const destPath = `${destination}/${path.basename(filepath)}`;
-    const success = await uploadDirectRclone(filepath, destPath, config);
-    const elapsed = (Date.now() - start) / 1000;
+    console.log(`→ Small file (${formatSize(fileSize)}) → direct upload`);
+    const start = performance.now();
+    const { success, error } = uploadFileRclone(filepath, destination, config, quota);
+    const elapsed = (performance.now() - start) / 1000;
+
     if (success) {
-      const speed = fileSize / elapsed;
-      console.log(chalk.green(`✓ Uploaded in ${formatDuration(elapsed)} (${formatSize(Math.floor(speed))}/s)\n`));
+      markCompleted(filepath, manifest);
     } else {
-      console.error(chalk.red('✗ Direct upload failed\n'));
+      markFailed(filepath, manifest, error);
     }
+
+    printSummary(success, filepath, fileSize, elapsed, false, 0, error);
     return success;
   }
 
-  // ─── Calculate chunks ────────────────────────────────────────────────────
-  const totalChunks = Math.ceil(fileSize / config.chunkSize);
+  // ─── Entropy analysis + compression ────────────────────────────────────────
+  console.log('→ Analyzing file entropy...');
+  const decision = analyzeFile(filepath);
+  console.log(`  → ${decision.toString()}`);
 
-  const separator = '═'.repeat(60);
-  console.log(`\n${chalk.cyan(separator)}`);
-  console.log(chalk.cyan('  ⚡ cloud-boost v2 — Production Upload Engine'));
-  console.log(chalk.cyan(separator));
-  console.log(`  File       : ${path.basename(filepath)}`);
-  console.log(`  Size       : ${formatSize(fileSize)}`);
-  console.log(`  Target     : ${destination}`);
-  console.log(`  Chunks     : ${totalChunks} × ${formatSize(config.chunkSize)}`);
-  console.log(`  Threads    : ${config.threads}`);
-  console.log(`  Compress   : level ${config.compressionLevel}`);
-  console.log(`  Integrity  : SHA-256 ${config.checksumVerify ? 'ON' : 'OFF'}`);
-  console.log(`  Resume     : ${config.resume ? 'ON' : 'OFF'}`);
-  if (config.maxBandwidth > 0) {
-    console.log(`  Bandwidth  : ${formatSize(config.maxBandwidth)}/s cap`);
-  }
-  console.log(chalk.cyan(separator) + '\n');
+  let uploadPath = filepath;
+  let wasCompressed = false;
+  let compressedSize = 0;
 
-  // ─── Load manifest (resume support) ──────────────────────────────────────
-  let manifest = await loadManifest(filepath);
+  if (decision.shouldCompress) {
+    console.log(`→ Compressing with ${getCompressorName()} (level ${decision.level})...`);
+    const compressStart = performance.now();
 
-  if (!manifest.source_hash && config.checksumVerify) {
-    console.log(chalk.cyan('→ Computing source file hash (SHA-256)...'));
-    manifest.source_hash = await computeSha256(filepath);
-    manifest.total_chunks = totalChunks;
-    manifest.chunk_size = config.chunkSize;
-    await saveManifest(filepath, manifest);
-    console.log(`  Hash: ${manifest.source_hash.slice(0, 16)}...`);
-  }
+    // Create temp compressed file
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudboost_'));
+    const compressedPath = path.join(tempDir, path.basename(filepath) + getCompressionExt());
 
-  // ─── Count already-done chunks ───────────────────────────────────────────
-  const alreadyDone = Object.values(manifest.chunks).filter(c => c.uploaded).length;
-  if (alreadyDone > 0) {
-    console.log(chalk.magenta(`→ Resuming — ${alreadyDone}/${totalChunks} chunks already uploaded\n`));
-  }
+    const result = await compressFile(filepath, compressedPath, decision);
+    const compressElapsed = (performance.now() - compressStart) / 1000;
 
-  // ─── Build chunk tasks ───────────────────────────────────────────────────
-  const chunkTasks = [];
-  for (let i = 0; i < totalChunks; i++) {
-    const offset = i * config.chunkSize;
-    const actualSize = Math.min(config.chunkSize, fileSize - offset);
-    chunkTasks.push({ index: i, offset, size: actualSize });
-  }
-
-  // ─── Parallel upload ─────────────────────────────────────────────────────
-  let totalUploaded = 0;
-  let totalSkipped = 0;
-  let totalFailed = 0;
-  let totalCompressedBytes = 0;
-  const uploadStart = Date.now();
-
-  const bar = new cliProgress.SingleBar({
-    format: '  Uploading |{bar}| {value}/{total} chunks [{duration_formatted}<{eta_formatted}]',
-  }, cliProgress.Presets.shades_classic);
-  bar.start(totalChunks, 0);
-
-  const limit = pLimit(config.threads);
-
-  const promises = chunkTasks.map(task =>
-    limit(async () => {
-      const result = await processAndUploadChunk(
-        filepath, task.index, task.offset, task.size, destination, config, manifest
-      );
-
-      if (result.success) {
-        if (result.skipped) {
-          totalSkipped++;
-        } else {
-          totalUploaded++;
-          totalCompressedBytes += result.compressedSize;
-        }
-      } else {
-        totalFailed++;
-        console.error(chalk.red(`\n  ✗ Chunk ${result.chunkIndex} failed${result.error ? ': ' + result.error : ''}`));
-      }
-
-      bar.increment();
-      return result;
-    })
-  );
-
-  await Promise.all(promises);
-  bar.stop();
-
-  const totalElapsed = (Date.now() - uploadStart) / 1000;
-
-  // ─── Summary ─────────────────────────────────────────────────────────────
-  console.log(`\n${chalk.cyan(separator)}`);
-  console.log(chalk.cyan('  Upload Summary'));
-  console.log(chalk.cyan(separator));
-
-  if (totalFailed === 0) {
-    const avgSpeed = fileSize / totalElapsed;
-    const compressionRatio = totalCompressedBytes > 0 && fileSize > 0
-      ? ((1 - totalCompressedBytes / fileSize) * 100)
-      : 0;
-
-    console.log(chalk.green('  Status     : ✓ COMPLETE'));
-    console.log(`  Uploaded   : ${totalUploaded} chunks`);
-    if (totalSkipped > 0) {
-      console.log(chalk.magenta(`  Skipped    : ${totalSkipped} (already uploaded)`));
+    if (result.wasCompressed) {
+      wasCompressed = true;
+      compressedSize = result.outputSize;
+      uploadPath = result.outputPath;
+      const ratio = ((1 - result.outputSize / fileSize) * 100).toFixed(1);
+      console.log(`  → Compressed: ${formatSize(result.outputSize)} (${ratio}% smaller, took ${formatDuration(compressElapsed)})`);
+      markCompressed(filepath, manifest, compressedPath, result.outputSize, getCompressorName());
+    } else {
+      console.log('  → Compression skipped (no benefit)');
+      // Clean up temp dir
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
-    console.log(`  Time       : ${formatDuration(totalElapsed)}`);
-    console.log(`  Avg Speed  : ${formatSize(Math.floor(avgSpeed))}/s`);
-    if (compressionRatio > 0) {
-      console.log(`  Compressed : ${compressionRatio.toFixed(1)}% smaller`);
-    }
-    console.log(chalk.cyan(separator) + '\n');
-
-    manifest.completed = true;
-    await saveManifest(filepath, manifest);
-    return true;
   } else {
-    console.log(chalk.red('  Status     : ✗ INCOMPLETE'));
-    console.log(`  Uploaded   : ${totalUploaded}/${totalChunks}`);
-    console.log(chalk.red(`  Failed     : ${totalFailed}`));
-    console.log(chalk.yellow("  → Run 'cloudboost resume' to retry failed chunks"));
-    console.log(chalk.cyan(separator) + '\n');
-    return false;
+    console.log(`  → Compression skipped: ${decision.reason}`);
   }
+
+  // ─── Upload via rclone ─────────────────────────────────────────────────────
+  const actualUploadSize = fs.statSync(uploadPath).size;
+  console.log(`→ Uploading ${formatSize(actualUploadSize)} via rclone (${config.rcloneTransfers} transfers, chunk=${config.rcloneDriveChunk})...`);
+
+  const uploadStart = performance.now();
+
+  const progressCb = (line) => {
+    if (line && (line.includes('Transferred:') || line.includes('ETA'))) {
+      process.stdout.write(`\r  ${chalk.yellow(line.slice(0, 80))}`);
+    }
+  };
+
+  const { success, error } = await uploadWithProgress(uploadPath, destination, config, quota, progressCb);
+  console.log(); // newline after progress
+
+  const uploadElapsed = (performance.now() - uploadStart) / 1000;
+
+  // ─── Cleanup compressed temp file ──────────────────────────────────────────
+  if (wasCompressed && uploadPath !== filepath) {
+    const tempDir = path.dirname(uploadPath);
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  // ─── Record result ─────────────────────────────────────────────────────────
+  if (success) {
+    markCompleted(filepath, manifest);
+  } else {
+    markFailed(filepath, manifest, error);
+  }
+
+  printSummary(success, filepath, fileSize, uploadElapsed, wasCompressed, compressedSize, error);
+  return success;
 }
 
 /**
- * Upload all files in a folder recursively.
+ * Upload a folder with smart pre-processing.
+ *
+ * Strategy:
+ * 1. Scan all files
+ * 2. Separate into compressible vs already-compressed
+ * 3. For compressible files: compress into staging dir
+ * 4. Upload everything via single rclone copy call
  */
-async function uploadFolder(folderpath, destination, config = null) {
-  const chalk = (await import('chalk')).default;
+export async function uploadFolder(folderpath, destination, config = null, quota = null) {
+  ensureDirs();
 
-  if (!(await fs.pathExists(folderpath))) {
+  const folder = path.resolve(folderpath);
+  if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
     console.error(chalk.red(`✗ Folder not found: ${folderpath}`));
     return false;
   }
 
-  const stat = await fs.stat(folderpath);
-  if (!stat.isDirectory()) {
-    console.error(chalk.red(`✗ Not a directory: ${folderpath}`));
+  if (!checkRcloneInstalled()) {
+    console.error(chalk.red('✗ rclone not installed.'));
     return false;
   }
 
-  // Collect all files recursively
-  const allFiles = [];
-  async function walk(dir) {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await walk(fullPath);
-      } else if (entry.isFile()) {
-        allFiles.push(fullPath);
+  // Collect files
+  const files = collectFiles(folder);
+  if (files.length === 0) {
+    console.error(chalk.red('✗ Folder is empty'));
+    return false;
+  }
+
+  const totalSize = files.reduce((sum, f) => sum + fs.statSync(f).size, 0);
+
+  if (config === null) {
+    config = UploadConfig.autoTune(totalSize);
+  }
+
+  if (quota === null) {
+    quota = new QuotaTracker(config.provider);
+  }
+
+  console.log(`\n${chalk.cyan(SEPARATOR)}`);
+  console.log(`${chalk.cyan('  ⚡ cloud-boost v3 — Folder Upload')}`);
+  console.log(`${chalk.cyan(SEPARATOR)}`);
+  console.log(`  Folder     : ${folder}`);
+  console.log(`  Files      : ${files.length}`);
+  console.log(`  Total Size : ${formatSize(totalSize)}`);
+  console.log(`  Target     : ${destination}`);
+  console.log(`  Provider   : ${config.provider}`);
+  console.log(`${chalk.cyan(SEPARATOR)}\n`);
+
+  // ─── Analyze all files ─────────────────────────────────────────────────────
+  console.log('→ Analyzing files for compression...');
+  const compressible = [];
+  const skipCompress = [];
+
+  for (const f of files) {
+    const decision = analyzeFile(f);
+    const fSize = fs.statSync(f).size;
+    if (decision.shouldCompress && fSize > 1 * MB) {
+      compressible.push({ path: f, decision });
+    } else {
+      skipCompress.push(f);
+    }
+  }
+
+  console.log(`  → ${compressible.length} files to compress, ${skipCompress.length} already compressed/small`);
+
+  // ─── Create staging directory with compressed files ────────────────────────
+  let stagingDir = null;
+  let uploadSource;
+
+  if (compressible.length > 0) {
+    stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudboost_stage_'));
+    console.log(`→ Pre-compressing ${compressible.length} files...`);
+
+    let compressedCount = 0;
+    let savedBytes = 0;
+
+    for (const { path: filePath, decision } of compressible) {
+      const rel = path.relative(folder, filePath);
+      const stagedPath = path.join(stagingDir, rel);
+      fs.mkdirSync(path.dirname(stagedPath), { recursive: true });
+
+      const result = await compressFile(filePath, stagedPath + getCompressionExt(), decision);
+
+      if (result.wasCompressed) {
+        compressedCount++;
+        savedBytes += fs.statSync(filePath).size - result.outputSize;
+      } else {
+        // Copy original to staging
+        copyFile(filePath, stagedPath);
       }
     }
+
+    // Copy non-compressible files to staging
+    for (const f of skipCompress) {
+      const rel = path.relative(folder, f);
+      const stagedPath = path.join(stagingDir, rel);
+      copyFile(f, stagedPath);
+    }
+
+    if (compressedCount > 0) {
+      console.log(`  → Compressed ${compressedCount} files, saved ${formatSize(savedBytes)}`);
+    }
+
+    uploadSource = stagingDir;
+  } else {
+    // Nothing to compress — upload folder directly
+    uploadSource = folder;
   }
-  await walk(folderpath);
 
-  if (allFiles.length === 0) {
-    console.error(chalk.red('✗ Folder is empty — nothing to upload'));
-    return false;
+  // ─── Upload via single rclone call ─────────────────────────────────────────
+  console.log(`→ Uploading via rclone (${config.rcloneTransfers} parallel transfers)...`);
+  const uploadStart = performance.now();
+
+  const { success, error } = uploadFolderRclone(uploadSource, destination, config, quota);
+
+  const elapsed = (performance.now() - uploadStart) / 1000;
+
+  // ─── Cleanup staging ───────────────────────────────────────────────────────
+  if (stagingDir) {
+    try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 
-  let totalSize = 0;
-  for (const f of allFiles) {
-    totalSize += (await fs.stat(f)).size;
-  }
+  // ─── Summary ───────────────────────────────────────────────────────────────
+  console.log(`\n${chalk.cyan(SEPARATOR)}`);
+  console.log(`${chalk.cyan('  Folder Upload Summary')}`);
+  console.log(`${chalk.cyan(SEPARATOR)}`);
 
-  console.log(chalk.cyan(`\n→ Found ${allFiles.length} files (${formatSize(totalSize)}) in ${folderpath}`));
-
-  let successCount = 0;
-  let failCount = 0;
-
-  for (let i = 0; i < allFiles.length; i++) {
-    const file = allFiles[i];
-    const relPath = path.relative(folderpath, file);
-    const fileDest = path.dirname(relPath) !== '.'
-      ? `${destination}/${path.dirname(relPath)}`
-      : destination;
-
-    console.log(`\n[${i + 1}/${allFiles.length}] ${relPath}`);
-
-    if (await uploadFile(file, fileDest, config)) {
-      successCount++;
-    } else {
-      failCount++;
+  if (success) {
+    const speed = elapsed > 0 ? totalSize / elapsed : 0;
+    console.log(`${chalk.green('  Status     : ✓ COMPLETE')}`);
+    console.log(`  Files      : ${files.length}`);
+    console.log(`  Total      : ${formatSize(totalSize)}`);
+    console.log(`  Time       : ${formatDuration(elapsed)}`);
+    console.log(`  Avg Speed  : ${formatSize(Math.floor(speed))}/s`);
+    const quotaPct = quota.usagePct();
+    if (quotaPct > 0) {
+      console.log(`  Quota Used : ${quotaPct.toFixed(1)}% of 750GB daily limit`);
+    }
+  } else {
+    console.log(`${chalk.red('  Status     : ✗ FAILED')}`);
+    if (error) {
+      console.log(`${chalk.red(`  Error      : ${error}`)}`);
     }
   }
 
-  // Final summary
-  const separator = '═'.repeat(60);
-  console.log(`\n${chalk.cyan(separator)}`);
-  console.log(chalk.cyan('  Folder Upload Summary'));
-  console.log(chalk.cyan(separator));
-  console.log(chalk.green(`  Success : ${successCount}/${allFiles.length}`));
-  if (failCount > 0) {
-    console.log(chalk.red(`  Failed  : ${failCount}`));
-  }
-  console.log(chalk.cyan(separator) + '\n');
-
-  return failCount === 0;
+  console.log(`${chalk.cyan(SEPARATOR)}\n`);
+  return success;
 }
-
-module.exports = { uploadFile, uploadFolder };
