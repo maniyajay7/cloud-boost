@@ -44,7 +44,7 @@ Before using cloud-boost, you need:
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cloud-boost.git
+git clone https://github.com/maniyajay7/cloud-boost.git
 cd cloud-boost
 ```
 
