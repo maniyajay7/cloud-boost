@@ -1,169 +1,384 @@
 """
-cloud-boost core uploader
-Handles: chunking, compression, parallel upload, resume
+cloud-boost core uploader v2
+Production-grade: streaming pipeline, 100GB+ support, integrity verification
 """
 
 import os
+import io
 import gzip
 import math
-import hashlib
-import json
-import shutil
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import tempfile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from colorama import Fore, Style, init
 
+from cloudboost.config import UploadConfig, format_size, format_duration, MB, GB, ensure_dirs
+from cloudboost.integrity import (
+    compute_sha256,
+    compute_chunk_hash,
+    load_manifest,
+    save_manifest,
+    clear_manifest,
+    is_chunk_uploaded,
+    mark_chunk_uploaded,
+    file_changed,
+)
+from cloudboost.transport import (
+    check_rclone_installed,
+    get_rclone_remotes,
+    upload_chunk as rclone_upload_chunk,
+    upload_direct_rclone,
+    upload_reassembly_manifest,
+)
+from cloudboost.logger import get_logger, log_with_data
+
 init(autoreset=True)
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-DEFAULT_CHUNK_SIZE_MB = 5
-DEFAULT_THREADS = 6
-CHECKPOINT_EXT = ".cbcheckpoint"
 
-
-def _chunk_file(filepath: str, chunk_size_mb: int) -> list[str]:
-    """Split a file into chunks. Returns list of chunk file paths."""
-    chunk_size = chunk_size_mb * 1024 * 1024
-    chunks = []
-    chunk_dir = Path(filepath).parent / f".cb_chunks_{Path(filepath).stem}"
-    chunk_dir.mkdir(exist_ok=True)
-
+def _stream_compress_chunk(filepath: str, offset: int, size: int, level: int) -> tuple[bytes, str]:
+    """
+    Read a chunk from file at offset, compress it in memory, return (compressed_bytes, raw_hash).
+    STREAMING: never writes raw chunk to disk — only compressed result touches disk.
+    """
     with open(filepath, "rb") as f:
-        index = 0
-        while True:
-            data = f.read(chunk_size)
-            if not data:
-                break
-            chunk_path = chunk_dir / f"chunk_{index:04d}.bin"
-            with open(chunk_path, "wb") as cf:
-                cf.write(data)
-            chunks.append(str(chunk_path))
-            index += 1
+        f.seek(offset)
+        raw_data = f.read(size)
 
-    return chunks
+    raw_hash = compute_chunk_hash(raw_data)
+
+    # Compress in memory
+    compressed = gzip.compress(raw_data, compresslevel=level)
+
+    return compressed, raw_hash
 
 
-def _compress_chunk(chunk_path: str) -> str:
-    """Gzip compress a chunk. Returns compressed file path."""
-    compressed_path = chunk_path + ".gz"
-    with open(chunk_path, "rb") as f_in:
-        with gzip.open(compressed_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    return compressed_path
+def _process_and_upload_chunk(
+    filepath: str,
+    chunk_index: int,
+    offset: int,
+    chunk_size: int,
+    destination: str,
+    config: UploadConfig,
+    manifest: dict,
+) -> dict:
+    """
+    Process a single chunk: read → compress → write temp → upload → delete temp.
+    Returns result dict with status and metrics.
+    """
+    result = {
+        "chunk_index": chunk_index,
+        "success": False,
+        "skipped": False,
+        "raw_size": 0,
+        "compressed_size": 0,
+        "upload_time": 0,
+    }
+
+    try:
+        # Step 1 — Stream read + compress in memory
+        compressed_data, raw_hash = _stream_compress_chunk(
+            filepath, offset, chunk_size, config.compression_level
+        )
+        result["raw_size"] = chunk_size
+        result["compressed_size"] = len(compressed_data)
+
+        # Step 2 — Check if already uploaded (dedup + resume)
+        if config.dedup and is_chunk_uploaded(manifest, chunk_index, raw_hash):
+            result["success"] = True
+            result["skipped"] = True
+            return result
+
+        # Step 3 — Write compressed chunk to temp file (only compressed touches disk)
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"cb_{chunk_index:06d}.gz")
+
+        with open(temp_path, "wb") as f:
+            f.write(compressed_data)
+
+        # Free compressed data from memory immediately
+        del compressed_data
+
+        # Step 4 — Upload via rclone
+        start_time = time.monotonic()
+        success = rclone_upload_chunk(temp_path, destination, chunk_index, config)
+        result["upload_time"] = time.monotonic() - start_time
+
+        if success:
+            mark_chunk_uploaded(manifest, chunk_index, raw_hash, result["compressed_size"])
+            save_manifest(filepath, manifest)
+            result["success"] = True
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    finally:
+        # Always clean up temp file
+        temp_path = os.path.join(tempfile.gettempdir(), f"cb_{chunk_index:06d}.gz")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    return result
 
 
-def _upload_chunk_rclone(chunk_path: str, destination: str, chunk_index: int) -> bool:
-    """Upload a single chunk to destination via rclone."""
-    dest_path = f"{destination}/chunks/chunk_{chunk_index:04d}.gz"
-    result = subprocess.run(
-        ["rclone", "copyto", chunk_path, dest_path, "--progress"],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
-def _save_checkpoint(filepath: str, uploaded_chunks: list[int]) -> None:
-    """Save upload progress checkpoint for resume support."""
-    checkpoint_path = filepath + CHECKPOINT_EXT
-    with open(checkpoint_path, "w") as f:
-        json.dump({"uploaded_chunks": uploaded_chunks}, f)
-
-
-def _load_checkpoint(filepath: str) -> list[int]:
-    """Load existing checkpoint if available."""
-    checkpoint_path = filepath + CHECKPOINT_EXT
-    if Path(checkpoint_path).exists():
-        with open(checkpoint_path) as f:
-            data = json.load(f)
-            return data.get("uploaded_chunks", [])
-    return []
-
-
-def _cleanup(filepath: str) -> None:
-    """Remove temp chunks and checkpoint after successful upload."""
-    chunk_dir = Path(filepath).parent / f".cb_chunks_{Path(filepath).stem}"
-    if chunk_dir.exists():
-        shutil.rmtree(chunk_dir)
-    checkpoint = filepath + CHECKPOINT_EXT
-    if Path(checkpoint).exists():
-        os.remove(checkpoint)
-
-
-def upload(
+def upload_file(
     filepath: str,
     destination: str,
-    threads: int = DEFAULT_THREADS,
-    chunk_size_mb: int = DEFAULT_CHUNK_SIZE_MB,
-    compress: bool = True,
+    config: UploadConfig | None = None,
 ) -> bool:
     """
-    Main upload function.
-    Splits file → compresses chunks → uploads in parallel → cleans up.
+    Main upload entry point. Handles single file upload with:
+    - Auto-tuned config based on file size
+    - Streaming compression (no raw chunk disk writes)
+    - Parallel upload with configurable threads
+    - SHA-256 integrity verification
+    - Resume from checkpoint
+    - Deduplication
+    - Progress bar with ETA
     """
+    logger = get_logger("cloudboost", verbose=config.verbose if config else False)
+    ensure_dirs()
+
+    # ─── Validations ──────────────────────────────────────────────────────────
     if not Path(filepath).exists():
-        print(f"{Fore.RED}✗ File not found: {filepath}")
+        logger.error(f"File not found: {filepath}")
         return False
 
-    file_size_mb = Path(filepath).stat().st_size / (1024 * 1024)
-    print(f"\n{Fore.CYAN}⚡ cloud-boost starting upload")
-    print(f"   File     : {filepath} ({file_size_mb:.1f} MB)")
-    print(f"   Target   : {destination}")
-    print(f"   Threads  : {threads}")
-    print(f"   Chunk    : {chunk_size_mb} MB")
-    print(f"   Compress : {'yes' if compress else 'no'}\n")
+    if not Path(filepath).is_file():
+        logger.error(f"Not a file: {filepath} (use upload_folder for directories)")
+        return False
 
-    # Step 1 — Split
-    print(f"{Fore.YELLOW}→ Splitting into chunks...")
-    chunks = _chunk_file(filepath, chunk_size_mb)
-    print(f"  {len(chunks)} chunks created\n")
+    if not check_rclone_installed():
+        logger.error("rclone is not installed. Install from https://rclone.org/install/")
+        return False
 
-    # Step 2 — Compress
-    if compress:
-        print(f"{Fore.YELLOW}→ Compressing chunks...")
-        compressed = []
-        for c in tqdm(chunks, desc="  Compressing", unit="chunk"):
-            compressed.append(_compress_chunk(c))
-        chunks = compressed
-        print()
+    file_size = Path(filepath).stat().st_size
+    if file_size == 0:
+        logger.error("File is empty — nothing to upload")
+        return False
 
-    # Step 3 — Resume check
-    already_uploaded = _load_checkpoint(filepath)
-    if already_uploaded:
-        print(f"{Fore.MAGENTA}→ Resuming — {len(already_uploaded)} chunks already done\n")
+    # ─── Auto-tune config ─────────────────────────────────────────────────────
+    if config is None:
+        config = UploadConfig.auto_tune(file_size)
+    else:
+        # Re-tune with user overrides preserved
+        auto = UploadConfig.auto_tune(file_size)
+        if config.threads == 6:  # still default → use auto
+            config.threads = auto.threads
+        if config.chunk_size == 8 * MB:  # still default → use auto
+            config.chunk_size = auto.chunk_size
 
-    # Step 4 — Parallel upload
-    print(f"{Fore.YELLOW}→ Uploading {len(chunks)} chunks with {threads} parallel threads...")
-    uploaded = list(already_uploaded)
-    failed = []
+    # ─── Small file fast path ─────────────────────────────────────────────────
+    if file_size < 50 * MB:
+        logger.info(f"Small file ({format_size(file_size)}) — using direct rclone upload")
+        start = time.monotonic()
+        success = upload_direct_rclone(filepath, f"{destination}/{Path(filepath).name}", config)
+        elapsed = time.monotonic() - start
+        if success:
+            speed = file_size / elapsed if elapsed > 0 else 0
+            logger.info(f"✓ Uploaded in {format_duration(elapsed)} ({format_size(int(speed))}/s)")
+        else:
+            logger.error("✗ Direct upload failed")
+        return success
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
+    # ─── Calculate chunks ─────────────────────────────────────────────────────
+    total_chunks = math.ceil(file_size / config.chunk_size)
+
+    print(f"\n{Fore.CYAN}{'═' * 60}")
+    print(f"{Fore.CYAN}  ⚡ cloud-boost v2 — Production Upload Engine")
+    print(f"{Fore.CYAN}{'═' * 60}")
+    print(f"{Fore.WHITE}  File       : {Path(filepath).name}")
+    print(f"{Fore.WHITE}  Size       : {format_size(file_size)}")
+    print(f"{Fore.WHITE}  Target     : {destination}")
+    print(f"{Fore.WHITE}  Chunks     : {total_chunks} × {format_size(config.chunk_size)}")
+    print(f"{Fore.WHITE}  Threads    : {config.threads}")
+    print(f"{Fore.WHITE}  Compress   : level {config.compression_level}")
+    print(f"{Fore.WHITE}  Integrity  : SHA-256 {'ON' if config.checksum_verify else 'OFF'}")
+    print(f"{Fore.WHITE}  Resume     : {'ON' if config.resume else 'OFF'}")
+    if config.max_bandwidth > 0:
+        print(f"{Fore.WHITE}  Bandwidth  : {format_size(config.max_bandwidth)}/s cap")
+    print(f"{Fore.CYAN}{'═' * 60}\n")
+
+    # ─── Load manifest (resume support) ───────────────────────────────────────
+    manifest = load_manifest(filepath)
+
+    if manifest["source_hash"] and config.resume:
+        if file_changed(filepath, manifest):
+            logger.warning("Source file changed since last upload — restarting from scratch")
+            manifest = load_manifest.__wrapped__(filepath) if hasattr(load_manifest, '__wrapped__') else {
+                "source_file": filepath,
+                "source_hash": "",
+                "total_chunks": 0,
+                "chunk_size": 0,
+                "chunks": {},
+                "completed": False,
+            }
+
+    # Compute source hash for first time or after change
+    if not manifest["source_hash"] and config.checksum_verify:
+        logger.info("Computing source file hash (SHA-256)...")
+        manifest["source_hash"] = compute_sha256(filepath)
+        manifest["total_chunks"] = total_chunks
+        manifest["chunk_size"] = config.chunk_size
+        save_manifest(filepath, manifest)
+        logger.info(f"Hash: {manifest['source_hash'][:16]}...")
+
+    # ─── Count already-done chunks ────────────────────────────────────────────
+    already_done = sum(
+        1 for k, v in manifest["chunks"].items() if v.get("uploaded", False)
+    )
+    if already_done > 0:
+        print(f"{Fore.MAGENTA}→ Resuming — {already_done}/{total_chunks} chunks already uploaded\n")
+
+    # ─── Build chunk tasks ────────────────────────────────────────────────────
+    chunk_tasks = []
+    for i in range(total_chunks):
+        offset = i * config.chunk_size
+        actual_size = min(config.chunk_size, file_size - offset)
+        chunk_tasks.append((i, offset, actual_size))
+
+    # ─── Parallel upload ──────────────────────────────────────────────────────
+    total_uploaded = 0
+    total_skipped = 0
+    total_failed = 0
+    total_compressed_bytes = 0
+    upload_start = time.monotonic()
+
+    bar = tqdm(
+        total=total_chunks,
+        initial=0,
+        desc=f"  {Fore.YELLOW}Uploading",
+        unit="chunk",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+
+    with ThreadPoolExecutor(max_workers=config.threads) as executor:
         futures = {
-            executor.submit(_upload_chunk_rclone, chunk, destination, i): i
-            for i, chunk in enumerate(chunks)
-            if i not in already_uploaded
+            executor.submit(
+                _process_and_upload_chunk,
+                filepath, idx, offset, size, destination, config, manifest,
+            ): idx
+            for idx, offset, size in chunk_tasks
         }
 
-        with tqdm(total=len(futures), desc="  Uploading", unit="chunk") as bar:
-            for future in as_completed(futures):
-                chunk_index = futures[future]
-                success = future.result()
-                if success:
-                    uploaded.append(chunk_index)
-                    _save_checkpoint(filepath, uploaded)
-                else:
-                    failed.append(chunk_index)
-                bar.update(1)
+        for future in as_completed(futures):
+            result = future.result()
 
-    # Step 5 — Result
-    if failed:
-        print(f"\n{Fore.RED}✗ {len(failed)} chunks failed. Run with --resume to retry.")
+            if result["success"]:
+                if result["skipped"]:
+                    total_skipped += 1
+                else:
+                    total_uploaded += 1
+                    total_compressed_bytes += result["compressed_size"]
+            else:
+                total_failed += 1
+                logger.error(
+                    f"Chunk {result['chunk_index']} failed"
+                    + (f": {result.get('error', 'unknown')}" if result.get("error") else "")
+                )
+
+            bar.update(1)
+
+    bar.close()
+    total_elapsed = time.monotonic() - upload_start
+
+    # ─── Upload reassembly manifest ───────────────────────────────────────────
+    reassembly = {
+        "original_file": Path(filepath).name,
+        "original_size": file_size,
+        "original_hash": manifest.get("source_hash", ""),
+        "total_chunks": total_chunks,
+        "chunk_size": config.chunk_size,
+        "compression": "gzip",
+        "compression_level": config.compression_level,
+    }
+    upload_reassembly_manifest(destination, reassembly, config)
+
+    # ─── Summary ──────────────────────────────────────────────────────────────
+    print(f"\n{Fore.CYAN}{'═' * 60}")
+    print(f"{Fore.CYAN}  Upload Summary")
+    print(f"{Fore.CYAN}{'═' * 60}")
+
+    if total_failed == 0:
+        avg_speed = file_size / total_elapsed if total_elapsed > 0 else 0
+        compression_ratio = (
+            (1 - total_compressed_bytes / file_size) * 100
+            if total_compressed_bytes > 0 and file_size > 0
+            else 0
+        )
+
+        print(f"{Fore.GREEN}  Status     : ✓ COMPLETE")
+        print(f"{Fore.WHITE}  Uploaded   : {total_uploaded} chunks")
+        if total_skipped > 0:
+            print(f"{Fore.MAGENTA}  Skipped    : {total_skipped} (already uploaded)")
+        print(f"{Fore.WHITE}  Time       : {format_duration(total_elapsed)}")
+        print(f"{Fore.WHITE}  Avg Speed  : {format_size(int(avg_speed))}/s")
+        if compression_ratio > 0:
+            print(f"{Fore.WHITE}  Compressed : {compression_ratio:.1f}% smaller")
+        print(f"{Fore.CYAN}{'═' * 60}\n")
+
+        # Mark complete and optionally clear manifest
+        manifest["completed"] = True
+        save_manifest(filepath, manifest)
+        return True
+
+    else:
+        print(f"{Fore.RED}  Status     : ✗ INCOMPLETE")
+        print(f"{Fore.WHITE}  Uploaded   : {total_uploaded}/{total_chunks}")
+        print(f"{Fore.RED}  Failed     : {total_failed}")
+        print(f"{Fore.YELLOW}  → Run 'cloudboost resume' to retry failed chunks")
+        print(f"{Fore.CYAN}{'═' * 60}\n")
         return False
 
-    _cleanup(filepath)
-    total = len(chunks)
-    print(f"\n{Fore.GREEN}✓ Upload complete! {total}/{total} chunks uploaded successfully.")
-    print(f"{Fore.GREEN}  Destination: {destination}\n")
-    return True
+
+def upload_folder(
+    folderpath: str,
+    destination: str,
+    config: UploadConfig | None = None,
+) -> bool:
+    """
+    Upload all files in a folder recursively.
+    Each file gets its own manifest for independent resume.
+    """
+    logger = get_logger("cloudboost")
+    folder = Path(folderpath)
+
+    if not folder.exists() or not folder.is_dir():
+        logger.error(f"Folder not found: {folderpath}")
+        return False
+
+    # Collect all files
+    files = sorted([f for f in folder.rglob("*") if f.is_file()])
+
+    if not files:
+        logger.error("Folder is empty — nothing to upload")
+        return False
+
+    total_size = sum(f.stat().st_size for f in files)
+    logger.info(f"Found {len(files)} files ({format_size(total_size)}) in {folderpath}")
+
+    success_count = 0
+    fail_count = 0
+
+    for i, file in enumerate(files, 1):
+        rel_path = file.relative_to(folder)
+        file_dest = f"{destination}/{rel_path.parent}" if str(rel_path.parent) != "." else destination
+
+        print(f"\n{Fore.WHITE}[{i}/{len(files)}] {rel_path}")
+
+        if upload_file(str(file), file_dest, config):
+            success_count += 1
+        else:
+            fail_count += 1
+
+    # Final summary
+    print(f"\n{Fore.CYAN}{'═' * 60}")
+    print(f"{Fore.CYAN}  Folder Upload Summary")
+    print(f"{Fore.CYAN}{'═' * 60}")
+    print(f"{Fore.GREEN}  Success : {success_count}/{len(files)}")
+    if fail_count > 0:
+        print(f"{Fore.RED}  Failed  : {fail_count}")
+    print(f"{Fore.CYAN}{'═' * 60}\n")
+
+    return fail_count == 0

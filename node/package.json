@@ -1,16 +1,17 @@
 {
   "name": "cloud-boost",
-  "version": "1.0.0",
-  "description": "Supercharge your cloud uploads with parallel chunking and compression",
+  "version": "2.0.0",
+  "description": "Supercharge your cloud uploads with parallel chunking, compression, and resume support",
   "main": "src/index.js",
   "bin": {
     "cloudboost": "src/cli.js"
   },
   "scripts": {
     "start": "node src/cli.js",
-    "test": "jest"
+    "test": "jest",
+    "doctor": "node src/cli.js doctor"
   },
-  "keywords": ["cloud", "upload", "rclone", "gdrive", "parallel", "fast"],
+  "keywords": ["cloud", "upload", "rclone", "gdrive", "parallel", "fast", "resume", "chunked"],
   "author": "Jay Maniya",
   "license": "MIT",
   "dependencies": {
@@ -19,12 +20,12 @@
     "commander": "^11.0.0",
     "fs-extra": "^11.1.1",
     "p-limit": "^5.0.0",
-    "zlib": "^1.0.5"
+    "which": "^4.0.0"
   },
   "devDependencies": {
     "jest": "^29.0.0"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   }
 }
