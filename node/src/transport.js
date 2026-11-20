@@ -371,6 +371,11 @@ export function serverSideCopy(sourceRemote, sourcePath, destination, progressCa
     const args = [
       'copyto', sourceFull, destFull,
       '--drive-server-side-across-configs',
+      '--contimeout=60s',
+      '--timeout=600s',
+      '--retries=5',
+      '--retries-sleep=3s',
+      '--low-level-retries=10',
       '--stats=1s',
       '--stats-one-line',
       '--verbose',
