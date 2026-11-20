@@ -101,10 +101,11 @@ export function buildRcloneFlags(config) {
     `--transfers=${config.rcloneTransfers}`,
     `--buffer-size=${config.rcloneBufferSize}`,
     '--checkers=16',
-    '--contimeout=30s',
-    '--timeout=300s',
-    '--retries=3',
-    '--low-level-retries=5',
+    '--contimeout=60s',
+    '--timeout=600s',
+    '--retries=5',
+    '--retries-sleep=3s',
+    '--low-level-retries=10',
     '--stats=1s',
     '--stats-one-line',
     `--tpslimit=${config.tpsLimit}`,
@@ -235,15 +236,18 @@ export function uploadWithProgress(source, destination, config, quota = null, pr
 
     const proc = spawn('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    let stderrData = '';
+    const lastLines = [];
 
     proc.stderr.on('data', (chunk) => {
       const lines = chunk.toString().split('\n');
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed) {
-          stderrData = trimmed;
-          if (progressCallback && (trimmed.includes('Transferred:') || trimmed.includes('ETA'))) {
+          lastLines.push(trimmed);
+          if (lastLines.length > 20) {
+            lastLines.shift();
+          }
+          if (progressCallback) {
             progressCallback(trimmed);
           }
         }
@@ -279,7 +283,12 @@ export function uploadWithProgress(source, destination, config, quota = null, pr
         }
         resolve({ success: true, error: '' });
       } else {
-        resolve({ success: false, error: stderrData.slice(0, 200) || 'rclone exited with non-zero status' });
+        let errorDetail = 'rclone exited with non-zero status';
+        if (lastLines.length > 0) {
+          const errorLines = lastLines.filter((l) => l.includes('ERROR') || l.includes('Failed') || l.toLowerCase().includes('fatal'));
+          errorDetail = errorLines.length > 0 ? errorLines[errorLines.length - 1].slice(0, 300) : lastLines[lastLines.length - 1].slice(0, 300);
+        }
+        resolve({ success: false, error: errorDetail });
       }
     });
 

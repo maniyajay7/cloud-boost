@@ -44,6 +44,98 @@ import {
 
 const SEPARATOR = '═'.repeat(60);
 
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const BAR_FILLED = '█';
+const BAR_EMPTY = '░';
+
+export class AnimatedProgressBar {
+  constructor(totalSize = 0, barLength = 26) {
+    this.totalSize = totalSize;
+    this.barLength = barLength;
+    this.percent = 0.0;
+    this.speed = '--';
+    this.eta = '--';
+    this.xferStr = '';
+    this.frameIdx = 0;
+  }
+
+  start(label = 'Connecting...') {
+    this.render(label);
+  }
+
+  updateFromRclone(line) {
+    if (!line) return;
+
+    const pctMatch = line.match(/(\d+(?:\.\d+)?)%/);
+    if (pctMatch) {
+      this.percent = Math.min(100.0, parseFloat(pctMatch[1]));
+    }
+
+    const speedMatch = line.match(/([\d.]+\s*[KMGTPE]?i?B\/s)/);
+    if (speedMatch) {
+      this.speed = speedMatch[1].trim();
+    }
+
+    const etaMatch = line.match(/ETA\s+([0-9a-zA-Z]+)/);
+    if (etaMatch) {
+      this.eta = etaMatch[1].trim();
+    } else {
+      const tailEta = line.match(/,\s*(\d+[smhd](?:\d+[smhd])*)/);
+      if (tailEta) {
+        this.eta = tailEta[1].trim();
+      }
+    }
+
+    const xferMatch = line.match(/([\d.]+\s*[KMGTPE]?i?B)\s*\/\s*([\d.]+\s*[KMGTPE]?i?B)/);
+    if (xferMatch) {
+      this.xferStr = `${xferMatch[1].trim()}/${xferMatch[2].trim()}`;
+    } else if (this.totalSize > 0 && this.percent > 0) {
+      const cur = Math.floor(this.totalSize * (this.percent / 100.0));
+      this.xferStr = `${formatSize(cur)}/${formatSize(this.totalSize)}`;
+    }
+
+    this.render();
+  }
+
+  render(label = '') {
+    this.frameIdx = (this.frameIdx + 1) % SPINNER_FRAMES.length;
+    const spinner = SPINNER_FRAMES[this.frameIdx];
+
+    const filledLen = Math.max(0, Math.min(this.barLength, Math.floor(this.barLength * (this.percent / 100.0))));
+    const emptyLen = this.barLength - filledLen;
+
+    const bar = `${chalk.green(BAR_FILLED.repeat(filledLen))}${chalk.gray(BAR_EMPTY.repeat(emptyLen))}`;
+
+    const parts = [
+      `\r  ${chalk.cyan(spinner)} [${bar}] ${chalk.yellow(`${this.percent.toFixed(1)}%`)}`
+    ];
+
+    if (label) {
+      parts.push(chalk.cyan(label));
+    } else {
+      if (this.xferStr) parts.push(chalk.cyan(this.xferStr));
+      if (this.speed !== '--') parts.push(chalk.green(this.speed));
+      if (this.eta !== '--') parts.push(`ETA: ${chalk.magenta(this.eta)}`);
+    }
+
+    const statusText = parts.join(' | ');
+    process.stdout.write(statusText.padEnd(115, ' '));
+  }
+
+  complete() {
+    const bar = chalk.green(BAR_FILLED.repeat(this.barLength));
+    const totalStr = this.totalSize > 0 ? ` | ${chalk.cyan(formatSize(this.totalSize))}` : '';
+    process.stdout.write(`\r  ${chalk.green('✓')} [${bar}] ${chalk.green('100.0%')}${totalStr} | ${chalk.green('Done!')}`.padEnd(115, ' ') + '\n');
+  }
+
+  fail() {
+    const filledLen = Math.max(0, Math.min(this.barLength, Math.floor(this.barLength * (this.percent / 100.0))));
+    const emptyLen = this.barLength - filledLen;
+    const bar = `${chalk.red(BAR_FILLED.repeat(filledLen))}${chalk.gray(BAR_EMPTY.repeat(emptyLen))}`;
+    process.stdout.write(`\r  ${chalk.red('✗')} [${bar}] ${chalk.red(`${this.percent.toFixed(1)}%`)} | ${chalk.red('Interrupted')}`.padEnd(115, ' ') + '\n');
+  }
+}
+
 /**
  * Recursively collect all files in a directory.
  */
@@ -249,14 +341,19 @@ export async function uploadFile(filepath, destination, config = null, quota = n
 
   const uploadStart = performance.now();
 
+  const progressBar = new AnimatedProgressBar(actualUploadSize);
+  progressBar.start('Connecting to remote...');
+
   const progressCb = (line) => {
-    if (line && (line.includes('Transferred:') || line.includes('ETA'))) {
-      process.stdout.write(`\r  ${chalk.yellow(line.slice(0, 80))}`);
-    }
+    progressBar.updateFromRclone(line);
   };
 
   const { success, error } = await uploadWithProgress(uploadPath, destination, config, quota, progressCb);
-  console.log(); // newline after progress
+  if (success) {
+    progressBar.complete();
+  } else {
+    progressBar.fail();
+  }
 
   const uploadElapsed = (performance.now() - uploadStart) / 1000;
 
@@ -392,7 +489,19 @@ export async function uploadFolder(folderpath, destination, config = null, quota
   console.log(`→ Uploading via rclone (${config.rcloneTransfers} parallel transfers)...`);
   const uploadStart = performance.now();
 
-  const { success, error } = uploadFolderRclone(uploadSource, destination, config, quota);
+  const progressBar = new AnimatedProgressBar(totalSize);
+  progressBar.start(`${files.length} files queued...`);
+
+  const folderProgressCb = (line) => {
+    progressBar.updateFromRclone(line);
+  };
+
+  const { success, error } = await uploadWithProgress(uploadSource, destination, config, quota, folderProgressCb);
+  if (success) {
+    progressBar.complete();
+  } else {
+    progressBar.fail();
+  }
 
   const elapsed = (performance.now() - uploadStart) / 1000;
 

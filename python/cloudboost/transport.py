@@ -101,10 +101,11 @@ def build_rclone_flags(config: UploadConfig) -> list[str]:
         f"--transfers={config.rclone_transfers}",
         f"--buffer-size={config.rclone_buffer_size}",
         "--checkers=16",
-        "--contimeout=30s",
-        "--timeout=300s",
-        "--retries=3",
-        "--low-level-retries=5",
+        "--contimeout=60s",
+        "--timeout=600s",
+        "--retries=5",
+        "--retries-sleep=3s",
+        "--low-level-retries=10",
         "--stats=1s",
         "--stats-one-line",
         f"--tpslimit={config.tps_limit}",
@@ -261,11 +262,16 @@ def upload_with_progress(
             bufsize=1,
         )
 
-        # Read progress from stderr line by line
+        # Read progress from stderr line by line, keep last N for error capture
+        last_lines: list[str] = []
         for line in iter(process.stderr.readline, ""):
             line = line.strip()
-            if line and progress_callback:
-                progress_callback(line)
+            if line:
+                last_lines.append(line)
+                if len(last_lines) > 20:
+                    last_lines.pop(0)
+                if progress_callback:
+                    progress_callback(line)
 
         process.wait(timeout=86400)
 
@@ -278,7 +284,16 @@ def upload_with_progress(
                 quota.add(total_size)
             return (True, "")
 
-        return (False, "rclone exited with non-zero status")
+        # Extract actual rclone error from captured stderr tail
+        error_detail = "rclone exited with non-zero status"
+        if last_lines:
+            # Filter out stats lines, find actual error messages
+            error_lines = [l for l in last_lines if "ERROR" in l or "Failed" in l or "fatal" in l.lower()]
+            if error_lines:
+                error_detail = error_lines[-1][:300]
+            else:
+                error_detail = last_lines[-1][:300]
+        return (False, error_detail)
 
     except subprocess.TimeoutExpired:
         process.kill()

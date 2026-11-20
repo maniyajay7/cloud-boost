@@ -10,13 +10,15 @@ Strategy:
 """
 
 import os
+import re
+import sys
 import time
 import shutil
 import tempfile
 from pathlib import Path
 from colorama import Fore, Style, init
 
-from cloudboost.config import UploadConfig, format_size, format_duration, MB, GB, ensure_dirs
+from cloudboost.config import UploadConfig, format_size, format_duration, MB, GB, KB, ensure_dirs
 from cloudboost.entropy import analyze_file, CompressionDecision
 from cloudboost.compressor import compress_file, get_compressor_name, get_compression_ext
 from cloudboost.transport import (
@@ -42,6 +44,117 @@ from cloudboost.logger import get_logger
 init(autoreset=True)
 
 SEPARATOR = "═" * 60
+
+# Terminal capability detection for progress bar glyphs
+try:
+    "█░⠋".encode(sys.stdout.encoding or "utf-8")
+    BAR_FILLED = "█"
+    BAR_EMPTY = "░"
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+except Exception:
+    BAR_FILLED = "#"
+    BAR_EMPTY = "-"
+    SPINNER_FRAMES = ["|", "/", "-", "\\"]
+
+
+class AnimatedProgressBar:
+    """
+    Animated terminal progress bar with spinning glyph, percentage,
+    transfer stats, speed, and ETA parsed dynamically from rclone output.
+    """
+
+    def __init__(self, total_size: int = 0, bar_length: int = 26):
+        self.total_size = total_size
+        self.bar_length = bar_length
+        self.percent = 0.0
+        self.speed = "--"
+        self.eta = "--"
+        self.xfer_str = ""
+        self.frame_idx = 0
+        self.rendered = False
+
+    def start(self, label: str = "Connecting...") -> None:
+        self.rendered = True
+        self.render(label=label)
+
+    def update_from_rclone(self, line: str) -> None:
+        if not line:
+            return
+
+        # Check percentage: e.g. "15%" or "15.5%"
+        pct_match = re.search(r"(\d+(?:\.\d+)?)%", line)
+        if pct_match:
+            try:
+                self.percent = min(100.0, float(pct_match.group(1)))
+            except ValueError:
+                pass
+
+        # Check speed: e.g. "890.120 KiB/s" or "1.25 MiB/s"
+        speed_match = re.search(r"([\d.]+\s*[KMGTPE]?i?B/s)", line)
+        if speed_match:
+            self.speed = speed_match.group(1).strip()
+
+        # Check ETA: e.g. "ETA 3m25s" or ", 3m25s"
+        eta_match = re.search(r"ETA\s+([0-9a-zA-Z]+)", line)
+        if eta_match:
+            self.eta = eta_match.group(1).strip()
+        else:
+            tail_eta = re.search(r",\s*(\d+[smhd](?:\d+[smhd])*)", line)
+            if tail_eta:
+                self.eta = tail_eta.group(1).strip()
+
+        # Check transferred / total: e.g. "32.450 MiB / 215.840 MiB"
+        xfer_match = re.search(r"([\d.]+\s*[KMGTPE]?i?B)\s*/\s*([\d.]+\s*[KMGTPE]?i?B)", line)
+        if xfer_match:
+            self.xfer_str = f"{xfer_match.group(1).strip()}/{xfer_match.group(2).strip()}"
+        elif self.total_size > 0 and self.percent > 0:
+            cur = int(self.total_size * (self.percent / 100.0))
+            self.xfer_str = f"{format_size(cur)}/{format_size(self.total_size)}"
+
+        self.render()
+
+    def render(self, label: str = "") -> None:
+        self.frame_idx = (self.frame_idx + 1) % len(SPINNER_FRAMES)
+        spinner = SPINNER_FRAMES[self.frame_idx]
+
+        filled_len = int(self.bar_length * (self.percent / 100.0))
+        filled_len = max(0, min(self.bar_length, filled_len))
+        empty_len = self.bar_length - filled_len
+
+        bar = f"{Fore.GREEN}{BAR_FILLED * filled_len}{Fore.LIGHTBLACK_EX}{BAR_EMPTY * empty_len}{Style.RESET_ALL}"
+
+        parts = [
+            f"\r  {Fore.CYAN}{spinner}{Style.RESET_ALL} [{bar}] {Fore.YELLOW}{self.percent:5.1f}%{Style.RESET_ALL}"
+        ]
+
+        if label:
+            parts.append(f"{Fore.CYAN}{label}{Style.RESET_ALL}")
+        else:
+            if self.xfer_str:
+                parts.append(f"{Fore.CYAN}{self.xfer_str}{Style.RESET_ALL}")
+            if self.speed != "--":
+                parts.append(f"{Fore.GREEN}{self.speed}{Style.RESET_ALL}")
+            if self.eta != "--":
+                parts.append(f"ETA: {Fore.MAGENTA}{self.eta}{Style.RESET_ALL}")
+
+        status_text = " | ".join(parts)
+        sys.stdout.write(f"{status_text:<115}")
+        sys.stdout.flush()
+
+    def complete(self) -> None:
+        bar = f"{Fore.GREEN}{BAR_FILLED * self.bar_length}{Style.RESET_ALL}"
+        total_str = format_size(self.total_size) if self.total_size > 0 else ""
+        tail = f" | {Fore.CYAN}{total_str}{Style.RESET_ALL}" if total_str else ""
+        sys.stdout.write(f"\r  {Fore.GREEN}✓{Style.RESET_ALL} [{bar}] {Fore.GREEN}100.0%{Style.RESET_ALL}{tail} | {Fore.GREEN}Done!{Style.RESET_ALL}                              \n")
+        sys.stdout.flush()
+
+    def fail(self) -> None:
+        filled_len = int(self.bar_length * (self.percent / 100.0))
+        filled_len = max(0, min(self.bar_length, filled_len))
+        empty_len = self.bar_length - filled_len
+        bar = f"{Fore.RED}{BAR_FILLED * filled_len}{Fore.LIGHTBLACK_EX}{BAR_EMPTY * empty_len}{Style.RESET_ALL}"
+        sys.stdout.write(f"\r  {Fore.RED}✗{Style.RESET_ALL} [{bar}] {Fore.RED}{self.percent:5.1f}%{Style.RESET_ALL} | {Fore.RED}Interrupted{Style.RESET_ALL}                          \n")
+        sys.stdout.flush()
 
 
 def _print_header(filepath: str, destination: str, config: UploadConfig, file_size: int) -> None:
@@ -233,13 +346,18 @@ def upload_file(
 
     upload_start = time.monotonic()
 
+    progress_bar = AnimatedProgressBar(total_size=actual_upload_size)
+    progress_bar.start("Connecting to remote...")
+
     def progress_cb(line: str) -> None:
-        """Print rclone progress updates."""
-        if line and ("Transferred:" in line or "ETA" in line):
-            print(f"\r  {Fore.YELLOW}{line[:80]}", end="", flush=True)
+        """Parse rclone progress into animated progress bar."""
+        progress_bar.update_from_rclone(line)
 
     success, error = upload_with_progress(upload_path, destination, config, quota, progress_cb)
-    print()  # newline after progress
+    if success:
+        progress_bar.complete()
+    else:
+        progress_bar.fail()
 
     upload_elapsed = time.monotonic() - upload_start
     total_elapsed = upload_elapsed  # could add compress time too
@@ -371,7 +489,18 @@ def upload_folder(
     logger.info(f"Uploading via rclone ({config.rclone_transfers} parallel transfers)...")
     upload_start = time.monotonic()
 
-    success, error = upload_folder_rclone(upload_source, destination, config, quota)
+    progress_bar = AnimatedProgressBar(total_size=total_size)
+    progress_bar.start(f"{len(files)} files queued...")
+
+    def folder_progress_cb(line: str) -> None:
+        """Parse rclone progress into animated progress bar."""
+        progress_bar.update_from_rclone(line)
+
+    success, error = upload_with_progress(upload_source, destination, config, quota, folder_progress_cb)
+    if success:
+        progress_bar.complete()
+    else:
+        progress_bar.fail()
 
     elapsed = time.monotonic() - upload_start
 
