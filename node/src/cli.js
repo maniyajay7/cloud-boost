@@ -3,6 +3,7 @@
 /**
  * cloud-boost v3 CLI
  * Production CLI with entropy-aware compression, quota tracking, setup wizard.
+ * Interactive mode when run without arguments.
  */
 
 import { Command } from 'commander';
@@ -10,6 +11,7 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import process from 'process';
+import readline from 'readline';
 import {
   UploadConfig,
   parseSize,
@@ -40,6 +42,235 @@ const BANNER = `${chalk.cyan(`
   ⚡ Entropy-aware | zstd | Quota-safe | Auto-tuned
 `;
 
+const SEP = '─'.repeat(50);
+
+// ─── Interactive Wizard Helpers ──────────────────────────────────────────────
+
+function createRl() {
+  return readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+}
+
+function ask(rl, query) {
+  return new Promise((resolve) => rl.question(query, (ans) => resolve(ans.trim())));
+}
+
+async function promptChoice(rl, title, options, defaultIdx = 0) {
+  console.log(`\n  ${chalk.cyan(title)}`);
+  console.log(`  ${chalk.gray(SEP)}`);
+
+  options.forEach((opt, i) => {
+    const marker = i === defaultIdx ? chalk.green('●') : chalk.gray('○');
+    const defaultTag = i === defaultIdx ? ` ${chalk.yellow('← default')}` : '';
+    const descText = opt.desc ? ` ${chalk.gray(`— ${opt.desc}`)}` : '';
+    console.log(`  ${marker} ${chalk.white(`${i + 1}. ${opt.label}`)}${descText}${defaultTag}`);
+  });
+
+  console.log(`  ${chalk.gray(SEP)}`);
+
+  while (true) {
+    const raw = await ask(rl, `  ${chalk.cyan('→')} Choose [1-${options.length}]: `);
+    if (!raw) return options[defaultIdx];
+    const idx = parseInt(raw, 10) - 1;
+    if (idx >= 0 && idx < options.length) {
+      return options[idx];
+    }
+    console.log(chalk.red(`    Invalid — enter a number 1-${options.length}`));
+  }
+}
+
+async function promptInput(rl, label, defaultVal = '') {
+  const hint = defaultVal ? ` ${chalk.gray(`[${defaultVal}]`)}` : '';
+  const raw = await ask(rl, `  ${chalk.cyan('→')} ${label}${hint}: `);
+  return raw || defaultVal;
+}
+
+async function promptYesNo(rl, label, defaultVal = true) {
+  const hint = defaultVal ? 'Y/n' : 'y/N';
+  const raw = (await ask(rl, `  ${chalk.cyan('→')} ${label} [${hint}]: `)).toLowerCase();
+  if (!raw) return defaultVal;
+  return raw === 'y' || raw === 'yes';
+}
+
+async function runInteractiveUpload() {
+  console.log(BANNER);
+  console.log(`  ${chalk.green('⚡ Interactive Upload Wizard')}`);
+  console.log(`  ${chalk.gray('Follow the prompts to upload your files.\n')}`);
+
+  const rl = createRl();
+
+  try {
+    // ─── Step 1: Select Cloud Provider ─────────────────────────────────────────
+    const remotes = getRcloneRemotes();
+    const providerMap = {
+      gdrive: ['Google Drive', 'Fast uploads with custom OAuth'],
+      s3: ['Amazon S3', 'AWS S3 compatible storage'],
+      azure: ['Azure Blob', 'Microsoft Azure storage'],
+      dropbox: ['Dropbox', 'Dropbox cloud storage'],
+      spaces: ['DigitalOcean Spaces', 'S3-compatible object storage'],
+      supabase: ['Supabase Storage', 'Postgres-backed storage'],
+    };
+
+    const providerOptions = [];
+    const seenProviders = new Set();
+
+    for (const remote of remotes) {
+      const remoteName = remote.replace(/:$/, '');
+      let matched = false;
+      for (const [key, [label, desc]] of Object.entries(providerMap)) {
+        if (remoteName.toLowerCase().includes(key)) {
+          providerOptions.push({
+            label: `${label} (${remote})`,
+            value: key,
+            remote,
+            desc: `✓ Configured — ${desc}`,
+          });
+          seenProviders.add(key);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        providerOptions.push({
+          label: `${remoteName} (${remote})`,
+          value: 'gdrive',
+          remote,
+          desc: '✓ Configured remote',
+        });
+      }
+    }
+
+    for (const [key, [label, desc]] of Object.entries(providerMap)) {
+      if (!seenProviders.has(key)) {
+        providerOptions.push({
+          label,
+          value: key,
+          remote: `${key}:`,
+          desc: "Not configured — run 'rclone config'",
+        });
+      }
+    }
+
+    const chosenProvider = await promptChoice(rl, 'Select Cloud Provider', providerOptions);
+    const provider = chosenProvider.value;
+    const remote = chosenProvider.remote;
+
+    // ─── Step 2: Source File or Folder ─────────────────────────────────────────
+    console.log();
+    let source = '';
+    while (true) {
+      source = await promptInput(rl, 'Enter file or folder path');
+      if (!source) {
+        console.log(chalk.red('    Path cannot be empty'));
+        continue;
+      }
+      source = source.replace(/^['"]|['"]$/g, '');
+      if (fs.existsSync(source)) {
+        if (fs.statSync(source).isDirectory()) {
+          const files = fs.readdirSync(source);
+          console.log(chalk.green(`    ✓ Folder found — ${files.length} item(s)`));
+        } else {
+          const size = fs.statSync(source).size;
+          console.log(chalk.green(`    ✓ File found — ${formatSize(size)}`));
+        }
+        break;
+      } else {
+        console.log(chalk.red(`    ✗ Path not found: ${source}`));
+        console.log(chalk.yellow('      Tip: Drag & drop the file into the terminal, or paste the full path'));
+      }
+    }
+
+    // ─── Step 3: Destination Path on Cloud ─────────────────────────────────────
+    console.log();
+    const defaultDest = `${remote}/Backup/`;
+    let destination = await promptInput(rl, 'Enter destination path on cloud', defaultDest);
+    if (!destination.includes(':')) {
+      destination = `${remote}${destination}`;
+    }
+
+    // ─── Step 4: Compression Preference ────────────────────────────────────────
+    const compressOptions = [
+      { label: 'Smart (auto-detect)', value: 'smart', desc: 'Compress only if beneficial' },
+      { label: 'No compression', value: 'none', desc: 'Upload file as-is (original format)' },
+      { label: 'Force compress', value: 'force', desc: `Always compress with ${getCompressorName()}` },
+    ];
+    const chosenCompress = await promptChoice(rl, 'Compression Mode', compressOptions);
+
+    // ─── Step 5: Advanced Options ──────────────────────────────────────────────
+    let threads = null;
+    let maxBw = null;
+    let verbose = false;
+
+    const showAdvanced = await promptYesNo(rl, 'Configure advanced options?', false);
+    if (showAdvanced) {
+      console.log();
+      const rawThreads = await promptInput(rl, 'Upload threads', 'auto');
+      if (rawThreads !== 'auto') {
+        const parsed = parseInt(rawThreads, 10);
+        if (!isNaN(parsed)) threads = parsed;
+      }
+
+      const rawBw = await promptInput(rl, "Bandwidth limit (e.g. 50MB, or 'none')", 'none');
+      if (rawBw.toLowerCase() !== 'none') {
+        try {
+          maxBw = parseSize(rawBw);
+        } catch { /* ignore */ }
+      }
+
+      verbose = await promptYesNo(rl, 'Enable verbose output?', false);
+    }
+
+    // ─── Confirmation ──────────────────────────────────────────────────────────
+    console.log(`\n  ${chalk.cyan('═'.repeat(50))}`);
+    console.log(`  ${chalk.white('  Upload Summary')}`);
+    console.log(`  ${chalk.cyan('═'.repeat(50))}`);
+    console.log(`  ${chalk.white('  Source      :')} ${source}`);
+    console.log(`  ${chalk.white('  Destination :')} ${destination}`);
+    console.log(`  ${chalk.white('  Provider    :')} ${provider}`);
+    console.log(`  ${chalk.white('  Compression :')} ${chosenCompress.label}`);
+    if (threads) console.log(`  ${chalk.white('  Threads     :')} ${threads}`);
+    if (maxBw) console.log(`  ${chalk.white('  Bandwidth   :')} ${formatSize(maxBw)}/s`);
+    console.log(`  ${chalk.cyan('═'.repeat(50))}`);
+
+    const proceed = await promptYesNo(rl, 'Start upload?', true);
+    rl.close();
+
+    if (!proceed) {
+      console.log(`\n  ${chalk.yellow('Upload cancelled.\n')}`);
+      process.exit(0);
+    }
+
+    // ─── Build config and run ──────────────────────────────────────────────────
+    const noCompress = chosenCompress.value === 'none';
+    const overrides = {
+      provider,
+      verbose,
+      compression: !noCompress,
+      dedup: true,
+    };
+    if (threads !== null) overrides.rcloneTransfers = threads;
+    if (maxBw !== null && maxBw > 0) overrides.maxBandwidth = maxBw;
+
+    const config = new UploadConfig(overrides);
+    const quota = new QuotaTracker(provider);
+
+    console.log();
+    let success;
+    if (fs.existsSync(source) && fs.statSync(source).isDirectory()) {
+      success = await uploadFolder(source, destination, config, quota);
+    } else {
+      success = await uploadFile(source, destination, config, quota);
+    }
+
+    process.exit(success ? 0 : 1);
+  } catch (err) {
+    rl.close();
+    throw err;
+  }
+}
+
 const program = new Command();
 
 program
@@ -51,8 +282,8 @@ program
 program
   .command('upload')
   .description('Upload FILE or FOLDER to cloud DESTINATION')
-  .argument('<source>', 'Local file or folder path')
-  .argument('<destination>', 'Cloud destination (e.g. gdrive:/backup/)')
+  .argument('[source]', 'Local file or folder path')
+  .argument('[destination]', 'Cloud destination (e.g. gdrive:/backup/)')
   .option('-t, --threads <n>', 'Upload threads (auto-tuned)', parseInt)
   .option('--no-compress', 'Skip compression entirely')
   .option('--no-dedup', 'Disable deduplication')
@@ -61,6 +292,12 @@ program
   .option('-p, --provider <name>', 'Cloud provider', 'gdrive')
   .option('-v, --verbose', 'Verbose output', false)
   .action(async (source, destination, opts) => {
+    // If no args provided, enter interactive wizard mode!
+    if (!source || !destination) {
+      await runInteractiveUpload();
+      return;
+    }
+
     console.log(BANNER);
 
     // Check custom client ID
@@ -73,8 +310,8 @@ program
     const overrides = {
       provider: opts.provider,
       verbose: opts.verbose,
-      compression: opts.compress !== false ? true : false,
-      dedup: opts.dedup !== false ? true : false,
+      compression: opts.compress !== false,
+      dedup: opts.dedup !== false,
     };
 
     if (opts.threads !== undefined) {
@@ -151,7 +388,7 @@ program
     const remotes = getRcloneRemotes();
     if (remotes.length > 0) {
       console.log(chalk.green(`  ✓ ${remotes.length} remote(s) configured:`));
-      remotes.forEach(r => console.log(`    · ${r}`));
+      remotes.forEach((r) => console.log(`    · ${r}`));
     } else {
       console.log(chalk.yellow("  ⚠ No remotes — run 'rclone config'"));
       allOk = false;
@@ -214,7 +451,7 @@ program
     const remotes = getRcloneRemotes();
     console.log(chalk.cyan('→ Configured remotes:\n'));
     if (remotes.length > 0) {
-      remotes.forEach(r => console.log(`  ✓ ${r}`));
+      remotes.forEach((r) => console.log(`  ✓ ${r}`));
     } else {
       console.log("  No remotes — run 'rclone config'");
     }
