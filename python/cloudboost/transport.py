@@ -391,15 +391,19 @@ def server_side_copy(
     source_path: str,
     destination: str,
     progress_callback=None,
+    max_attempts: int = 3,
 ) -> tuple[bool, str]:
     """
     Perform a server-side copy on the same rclone remote.
     No data flows through the local machine — Google Drive copies internally.
+    Retries up to max_attempts on network or DNS glitches.
 
     Args:
         source_remote: Remote name, e.g. "gdrive:"
         source_path:   Path on remote, e.g. "Movie/file.mkv"
         destination:   Full rclone destination, e.g. "gdrive:/Backup/"
+        progress_callback: Callback for real-time progress
+        max_attempts:  Retry count on network/DNS errors
     """
     source_full = f"{source_remote}{source_path}"
 
@@ -423,45 +427,60 @@ def server_side_copy(
 
     logger.info(f"Server-side copy: {source_full} → {dest_full}")
 
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+    last_error = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
 
-        last_lines: list[str] = []
-        for line in iter(process.stderr.readline, ""):
-            line = line.strip()
-            if line:
-                last_lines.append(line)
-                if len(last_lines) > 20:
-                    last_lines.pop(0)
-                if progress_callback:
-                    progress_callback(line)
+            last_lines: list[str] = []
+            for line in iter(process.stderr.readline, ""):
+                line = line.strip()
+                if line:
+                    last_lines.append(line)
+                    if len(last_lines) > 20:
+                        last_lines.pop(0)
+                    if progress_callback:
+                        progress_callback(line)
 
-        process.wait(timeout=600)
+            process.wait(timeout=600)
 
-        if process.returncode == 0:
-            return (True, "")
+            if process.returncode == 0:
+                return (True, "")
 
-        error_detail = "Server-side copy failed"
-        if last_lines:
-            error_lines = [l for l in last_lines
-                           if "ERROR" in l or "Failed" in l or "fatal" in l.lower()]
-            if error_lines:
-                error_detail = error_lines[-1][:300]
-            else:
-                error_detail = last_lines[-1][:300]
-        return (False, error_detail)
+            error_detail = "Server-side copy failed"
+            if last_lines:
+                error_lines = [l for l in last_lines
+                               if "ERROR" in l or "Failed" in l or "fatal" in l.lower()]
+                if error_lines:
+                    error_detail = error_lines[-1]
+                else:
+                    error_detail = last_lines[-1]
+            last_error = error_detail
 
-    except subprocess.TimeoutExpired:
-        process.kill()
-        return (False, "Server-side copy timed out")
-    except Exception as e:
-        return (False, str(e)[:200])
+            # If DNS or network error occurred during initialization, retry
+            is_net_error = any(
+                k in error_detail.lower()
+                for k in ["dial tcp", "lookup", "connection reset", "no such host", "i/o timeout"]
+            )
+            if is_net_error and attempt < max_attempts:
+                time.sleep(2)
+                continue
+
+            return (False, error_detail[:300])
+
+        except subprocess.TimeoutExpired:
+            process.kill()
+            last_error = "Server-side copy timed out"
+        except Exception as e:
+            last_error = str(e)[:200]
+
+    return (False, last_error[:300])
 
 
 

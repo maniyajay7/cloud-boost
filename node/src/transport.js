@@ -362,62 +362,82 @@ export async function detectRcloneMount(sourcePath) {
  * Perform a server-side copy on the same rclone remote.
  * No data flows through the local machine.
  */
-export function serverSideCopy(sourceRemote, sourcePath, destination, progressCallback = null) {
-  return new Promise((resolve) => {
-    const sourceFull = `${sourceRemote}${sourcePath}`;
-    const filename = sourcePath.includes('/') ? sourcePath.split('/').pop() : sourcePath;
-    const destFull = `${destination.replace(/\/$/, '')}/${filename}`;
+export async function serverSideCopy(sourceRemote, sourcePath, destination, progressCallback = null, maxAttempts = 3) {
+  const sourceFull = `${sourceRemote}${sourcePath}`;
+  const filename = sourcePath.includes('/') ? sourcePath.split('/').pop() : sourcePath;
+  const destFull = `${destination.replace(/\/$/, '')}/${filename}`;
 
-    const args = [
-      'copyto', sourceFull, destFull,
-      '--drive-server-side-across-configs',
-      '--contimeout=60s',
-      '--timeout=600s',
-      '--retries=5',
-      '--retries-sleep=3s',
-      '--low-level-retries=10',
-      '--stats=1s',
-      '--stats-one-line',
-      '--verbose',
-    ];
+  const args = [
+    'copyto', sourceFull, destFull,
+    '--drive-server-side-across-configs',
+    '--contimeout=60s',
+    '--timeout=600s',
+    '--retries=5',
+    '--retries-sleep=3s',
+    '--low-level-retries=10',
+    '--stats=1s',
+    '--stats-one-line',
+    '--verbose',
+  ];
 
-    const proc = spawn('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let lastError = '';
 
-    const lastLines = [];
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await new Promise((resolve) => {
+      const proc = spawn('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const lastLines = [];
 
-    proc.stderr.on('data', (chunk) => {
-      const lines = chunk.toString().split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed) {
-          lastLines.push(trimmed);
-          if (lastLines.length > 20) lastLines.shift();
-          if (progressCallback) progressCallback(trimmed);
+      proc.stderr.on('data', (chunk) => {
+        const lines = chunk.toString().split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) {
+            lastLines.push(trimmed);
+            if (lastLines.length > 20) lastLines.shift();
+            if (progressCallback) progressCallback(trimmed);
+          }
         }
-      }
-    });
+      });
 
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve({ success: true, error: '' });
-      } else {
-        let errorDetail = 'Server-side copy failed';
-        if (lastLines.length > 0) {
-          const errorLines = lastLines.filter(
-            (l) => l.includes('ERROR') || l.includes('Failed') || l.toLowerCase().includes('fatal')
-          );
-          errorDetail = errorLines.length > 0
-            ? errorLines[errorLines.length - 1].slice(0, 300)
-            : lastLines[lastLines.length - 1].slice(0, 300);
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve({ success: true, error: '' });
+        } else {
+          let errorDetail = 'Server-side copy failed';
+          if (lastLines.length > 0) {
+            const errorLines = lastLines.filter(
+              (l) => l.includes('ERROR') || l.includes('Failed') || l.toLowerCase().includes('fatal')
+            );
+            errorDetail = errorLines.length > 0
+              ? errorLines[errorLines.length - 1].slice(0, 300)
+              : lastLines[lastLines.length - 1].slice(0, 300);
+          }
+          resolve({ success: false, error: errorDetail });
         }
-        resolve({ success: false, error: errorDetail });
-      }
+      });
+
+      proc.on('error', (err) => {
+        resolve({ success: false, error: err.message.slice(0, 200) });
+      });
     });
 
-    proc.on('error', (err) => {
-      resolve({ success: false, error: err.message.slice(0, 200) });
-    });
-  });
+    if (result.success) {
+      return result;
+    }
+
+    lastError = result.error;
+    const isNetError = ['dial tcp', 'lookup', 'connection reset', 'no such host', 'i/o timeout']
+      .some((k) => lastError.toLowerCase().includes(k));
+
+    if (isNetError && attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+
+    return result;
+  }
+
+  return { success: false, error: lastError };
 }
 
 
