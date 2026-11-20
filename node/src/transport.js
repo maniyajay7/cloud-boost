@@ -297,3 +297,120 @@ export function uploadWithProgress(source, destination, config, quota = null, pr
     });
   });
 }
+
+
+
+// ─── Server-side copy detection ──────────────────────────────────────────────
+
+/**
+ * Detect if sourcePath resides on an rclone-mounted drive (Windows).
+ * Returns { remote, remotePath } or null.
+ */
+export async function detectRcloneMount(sourcePath) {
+  sourcePath = path.resolve(sourcePath);
+
+  // Use abspath behavior: if resolve() converted to UNC, extract drive letter
+  // from the original path instead
+  const originalDrive = sourcePath.length >= 3 && sourcePath[1] === ':' ? sourcePath[0].toUpperCase() : null;
+  if (!originalDrive) return null;
+
+  try {
+    const { execSync } = await import('child_process');
+    const output = execSync(
+      'powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"Name=\'rclone.exe\'\\").CommandLine"',
+      { encoding: 'utf-8', timeout: 10000 }
+    ).trim();
+
+    if (!output) return null;
+
+    for (const cmdline of output.split('\n')) {
+      const line = cmdline.trim();
+      if (!line) continue;
+
+      const mountPos = line.toLowerCase().indexOf(' mount ');
+      if (mountPos === -1) continue;
+
+      const afterMount = line.slice(mountPos + 7).trim();
+      const afterParts = afterMount.split(/\s+/);
+      if (afterParts.length < 2) continue;
+
+      const remoteArg = afterParts[0];   // "gdrive:" or "gdrive:subfolder"
+      const mountPoint = afterParts[1];  // "Z:" or "Z:\"
+
+      const mountDrive = mountPoint.replace(/[:\\/]/g, '').toUpperCase();
+      if (mountDrive.length !== 1 || mountDrive !== originalDrive) continue;
+
+      if (!remoteArg.includes(':')) continue;
+
+      const colonPos = remoteArg.indexOf(':');
+      const remoteName = remoteArg.slice(0, colonPos + 1);
+      const basePath = remoteArg.slice(colonPos + 1);
+
+      const relative = sourcePath.slice(3).replace(/\\/g, '/');
+      const fullPath = basePath ? `${basePath.replace(/^\/|\/$/g, '')}/${relative}` : relative;
+
+      return { remote: remoteName, remotePath: fullPath };
+    }
+  } catch {
+    // Detection failure is non-fatal
+  }
+
+  return null;
+}
+
+/**
+ * Perform a server-side copy on the same rclone remote.
+ * No data flows through the local machine.
+ */
+export function serverSideCopy(sourceRemote, sourcePath, destination, progressCallback = null) {
+  return new Promise((resolve) => {
+    const sourceFull = `${sourceRemote}${sourcePath}`;
+    const filename = sourcePath.includes('/') ? sourcePath.split('/').pop() : sourcePath;
+    const destFull = `${destination.replace(/\/$/, '')}/${filename}`;
+
+    const args = [
+      'copyto', sourceFull, destFull,
+      '--drive-server-side-across-configs',
+      '--stats=1s',
+      '--stats-one-line',
+      '--verbose',
+    ];
+
+    const proc = spawn('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    const lastLines = [];
+
+    proc.stderr.on('data', (chunk) => {
+      const lines = chunk.toString().split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          lastLines.push(trimmed);
+          if (lastLines.length > 20) lastLines.shift();
+          if (progressCallback) progressCallback(trimmed);
+        }
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve({ success: true, error: '' });
+      } else {
+        let errorDetail = 'Server-side copy failed';
+        if (lastLines.length > 0) {
+          const errorLines = lastLines.filter(
+            (l) => l.includes('ERROR') || l.includes('Failed') || l.toLowerCase().includes('fatal')
+          );
+          errorDetail = errorLines.length > 0
+            ? errorLines[errorLines.length - 1].slice(0, 300)
+            : lastLines[lastLines.length - 1].slice(0, 300);
+        }
+        resolve({ success: false, error: errorDetail });
+      }
+    });
+
+    proc.on('error', (err) => {
+      resolve({ success: false, error: err.message.slice(0, 200) });
+    });
+  });
+}

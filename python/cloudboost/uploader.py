@@ -27,6 +27,8 @@ from cloudboost.transport import (
     upload_file_rclone,
     upload_folder_rclone,
     upload_with_progress,
+    detect_rclone_mount,
+    server_side_copy,
     QuotaTracker,
 )
 from cloudboost.manifest import (
@@ -230,7 +232,7 @@ def upload_file(
     ensure_dirs()
 
     # ─── Validate ─────────────────────────────────────────────────────────────
-    filepath = str(Path(filepath).resolve())
+    filepath = os.path.abspath(filepath)
 
     if not Path(filepath).exists():
         logger.error(f"File not found: {filepath}")
@@ -257,6 +259,49 @@ def upload_file(
     if config.dedup and is_already_uploaded(filepath, destination):
         logger.info(f"Already uploaded: {Path(filepath).name} → skipping")
         return True
+
+    # ─── Server-side copy detection ──────────────────────────────────────────
+    mount_info = detect_rclone_mount(filepath)
+    if mount_info:
+        source_remote, remote_path = mount_info
+        dest_remote = destination[:destination.index(':') + 1] if ':' in destination else ''
+
+        if dest_remote and source_remote.lower() == dest_remote.lower():
+            # Same remote — instant server-side copy, zero local bandwidth
+            print(f"\n{Fore.CYAN}{SEPARATOR}")
+            print(f"{Fore.GREEN}  ⚡ SERVER-SIDE COPY — Zero Local Bandwidth!")
+            print(f"{Fore.CYAN}{SEPARATOR}")
+            print(f"  File       : {Path(filepath).name}")
+            print(f"  Size       : {format_size(file_size)}")
+            print(f"  Source     : {source_remote}{remote_path}")
+            print(f"  Target     : {destination}")
+            print(f"{Fore.GREEN}  Mode       : Drive server-side copy (instant)")
+            print(f"{Fore.CYAN}{SEPARATOR}\n")
+
+            manifest = create_manifest(filepath)
+            mark_uploading(filepath, manifest, destination)
+
+            start = time.monotonic()
+
+            progress_bar = AnimatedProgressBar(total_size=file_size)
+            progress_bar.start("Server-side copy in progress...")
+
+            success, error = server_side_copy(
+                source_remote, remote_path, destination,
+                progress_callback=lambda line: progress_bar.update_from_rclone(line)
+            )
+
+            elapsed = time.monotonic() - start
+
+            if success:
+                progress_bar.complete()
+                mark_completed(filepath, manifest)
+            else:
+                progress_bar.fail()
+                mark_failed(filepath, manifest, error)
+
+            _print_summary(success, filepath, file_size, elapsed, error=error)
+            return success
 
     # ─── Print header ─────────────────────────────────────────────────────────
     _print_header(filepath, destination, config, file_size)

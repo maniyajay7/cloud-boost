@@ -300,3 +300,160 @@ def upload_with_progress(
         return (False, "Upload timed out")
     except Exception as e:
         return (False, str(e)[:200])
+
+
+
+# ─── Server-side copy detection ──────────────────────────────────────────────
+
+def detect_rclone_mount(source_path: str) -> tuple[str, str] | None:
+    """
+    Detect if source_path resides on an rclone-mounted drive (Windows).
+
+    Inspects running rclone mount processes to find which drive letter
+    maps to which remote. Returns (remote_name, remote_relative_path)
+    if the source is on a mounted remote, None otherwise.
+
+    Example:
+        Mount:  rclone mount gdrive: Z: --vfs-cache-mode full
+        Source: Z:\\Movie\\file.mkv
+        Return: ("gdrive:", "Movie/file.mkv")
+    """
+    source_path = os.path.abspath(source_path)
+
+    # Windows drive letter check
+    if len(source_path) < 3 or source_path[1] != ':':
+        return None
+
+    drive_letter = source_path[0].upper()
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\").CommandLine"],
+            capture_output=True, text=True, timeout=10,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+
+        for cmdline in result.stdout.strip().split('\n'):
+            cmdline = cmdline.strip()
+            if not cmdline:
+                continue
+
+            # Find " mount " as substring (avoids quoted-path split issues)
+            mount_pos = cmdline.lower().find(' mount ')
+            if mount_pos == -1:
+                continue
+
+            # Parse args after "mount ": remote, mount_point, ...flags
+            after_mount = cmdline[mount_pos + 7:].strip()
+            after_parts = after_mount.split()
+            if len(after_parts) < 2:
+                continue
+
+            remote_arg = after_parts[0]    # e.g. "gdrive:" or "gdrive:subfolder"
+            mount_point = after_parts[1]   # e.g. "Z:" or "Z:\"
+
+            # Extract drive letter from mount point
+            mount_drive = mount_point.rstrip(':\\/').upper()
+
+            if len(mount_drive) != 1 or mount_drive != drive_letter:
+                continue
+
+            # Validate remote_arg has ':'
+            if ':' not in remote_arg:
+                continue
+
+            colon_pos = remote_arg.index(':')
+            remote_name = remote_arg[:colon_pos + 1]   # "gdrive:"
+            base_path = remote_arg[colon_pos + 1:]      # "" or "subfolder"
+
+            # Build full remote path from drive-relative path
+            relative = source_path[3:]  # Strip "Z:\"
+            relative = relative.replace('\\', '/')
+
+            if base_path:
+                full_path = f"{base_path.strip('/')}/{relative}"
+            else:
+                full_path = relative
+
+            return (remote_name, full_path)
+
+    except Exception:
+        pass
+
+    return None
+
+
+def server_side_copy(
+    source_remote: str,
+    source_path: str,
+    destination: str,
+    progress_callback=None,
+) -> tuple[bool, str]:
+    """
+    Perform a server-side copy on the same rclone remote.
+    No data flows through the local machine — Google Drive copies internally.
+
+    Args:
+        source_remote: Remote name, e.g. "gdrive:"
+        source_path:   Path on remote, e.g. "Movie/file.mkv"
+        destination:   Full rclone destination, e.g. "gdrive:/Backup/"
+    """
+    source_full = f"{source_remote}{source_path}"
+
+    # Build destination path with filename
+    filename = source_path.rsplit('/', 1)[-1] if '/' in source_path else source_path
+    dest_full = f"{destination.rstrip('/')}/{filename}"
+
+    cmd = [
+        "rclone", "copyto",
+        source_full, dest_full,
+        "--drive-server-side-across-configs",
+        "--stats=1s",
+        "--stats-one-line",
+        "--verbose",
+    ]
+
+    logger.info(f"Server-side copy: {source_full} → {dest_full}")
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        last_lines: list[str] = []
+        for line in iter(process.stderr.readline, ""):
+            line = line.strip()
+            if line:
+                last_lines.append(line)
+                if len(last_lines) > 20:
+                    last_lines.pop(0)
+                if progress_callback:
+                    progress_callback(line)
+
+        process.wait(timeout=600)
+
+        if process.returncode == 0:
+            return (True, "")
+
+        error_detail = "Server-side copy failed"
+        if last_lines:
+            error_lines = [l for l in last_lines
+                           if "ERROR" in l or "Failed" in l or "fatal" in l.lower()]
+            if error_lines:
+                error_detail = error_lines[-1][:300]
+            else:
+                error_detail = last_lines[-1][:300]
+        return (False, error_detail)
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return (False, "Server-side copy timed out")
+    except Exception as e:
+        return (False, str(e)[:200])

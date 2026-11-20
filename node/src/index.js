@@ -29,6 +29,8 @@ import {
   uploadFileRclone,
   uploadFolderRclone,
   uploadWithProgress,
+  detectRcloneMount,
+  serverSideCopy,
   QuotaTracker,
 } from './transport.js';
 import {
@@ -258,6 +260,51 @@ export async function uploadFile(filepath, destination, config = null, quota = n
   if (config.dedup && isAlreadyUploaded(filepath, destination)) {
     console.log(chalk.green(`→ Already uploaded: ${path.basename(filepath)} → skipping`));
     return true;
+  }
+
+  // ─── Server-side copy detection ────────────────────────────────────────────
+  const mountInfo = await detectRcloneMount(filepath);
+  if (mountInfo) {
+    const { remote: sourceRemote, remotePath } = mountInfo;
+    const destRemote = destination.includes(':') ? destination.slice(0, destination.indexOf(':') + 1) : '';
+
+    if (destRemote && sourceRemote.toLowerCase() === destRemote.toLowerCase()) {
+      console.log(`\n${chalk.cyan(SEPARATOR)}`);
+      console.log(`${chalk.green('  ⚡ SERVER-SIDE COPY — Zero Local Bandwidth!')}`);
+      console.log(`${chalk.cyan(SEPARATOR)}`);
+      console.log(`  File       : ${path.basename(filepath)}`);
+      console.log(`  Size       : ${formatSize(fileSize)}`);
+      console.log(`  Source     : ${sourceRemote}${remotePath}`);
+      console.log(`  Target     : ${destination}`);
+      console.log(`${chalk.green('  Mode       : Drive server-side copy (instant)')}`);
+      console.log(`${chalk.cyan(SEPARATOR)}\n`);
+
+      const manifest = createManifest(filepath);
+      markUploading(filepath, manifest, destination);
+
+      const start = performance.now();
+
+      const progressBar = new AnimatedProgressBar(fileSize);
+      progressBar.start('Server-side copy in progress...');
+
+      const { success, error } = await serverSideCopy(
+        sourceRemote, remotePath, destination,
+        (line) => progressBar.updateFromRclone(line)
+      );
+
+      const elapsed = (performance.now() - start) / 1000;
+
+      if (success) {
+        progressBar.complete();
+        markCompleted(filepath, manifest);
+      } else {
+        progressBar.fail();
+        markFailed(filepath, manifest, error);
+      }
+
+      printSummary(success, filepath, fileSize, elapsed, false, 0, error);
+      return success;
+    }
   }
 
   // ─── Print header ──────────────────────────────────────────────────────────
