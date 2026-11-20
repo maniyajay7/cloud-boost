@@ -29,6 +29,7 @@ from cloudboost.transport import (
     upload_with_progress,
     detect_rclone_mount,
     server_side_copy,
+    normalize_destination,
     QuotaTracker,
 )
 from cloudboost.manifest import (
@@ -232,7 +233,8 @@ def upload_file(
     ensure_dirs()
 
     # ─── Validate ─────────────────────────────────────────────────────────────
-    filepath = os.path.abspath(filepath)
+    filepath = os.path.abspath(str(filepath).strip().strip('"').strip("'"))
+    destination = normalize_destination(destination, default_remote=f"{config.provider}:" if config else "gdrive:")
 
     if not Path(filepath).exists():
         logger.error(f"File not found: {filepath}")
@@ -443,6 +445,8 @@ def upload_folder(
     logger = get_logger("cloudboost", verbose=config.verbose if config else False)
     ensure_dirs()
 
+    folderpath = str(folderpath).strip().strip('"').strip("'")
+    destination = normalize_destination(destination, default_remote=f"{config.provider}:" if config else "gdrive:")
     folder = Path(folderpath).resolve()
     if not folder.exists() or not folder.is_dir():
         logger.error(f"Folder not found: {folderpath}")

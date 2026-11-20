@@ -23,6 +23,7 @@ from cloudboost.uploader import upload_file, upload_folder
 from cloudboost.transport import (
     check_rclone_installed,
     get_rclone_remotes,
+    normalize_destination,
     QuotaTracker,
 )
 from cloudboost.setup_wizard import print_setup_guide, check_custom_client_id
@@ -99,157 +100,73 @@ def _prompt_yes_no(prompt: str, default: bool = True) -> bool:
 
 
 def interactive_upload():
-    """Full interactive upload wizard — runs when 'cloudboost upload' has no args."""
+    """Simple, user-friendly interactive upload wizard."""
     print(BANNER)
-    print(f"  {Fore.GREEN}⚡ Interactive Upload Wizard{Style.RESET_ALL}")
-    print(f"  {Fore.LIGHTBLACK_EX}Follow the prompts to upload your files.{Style.RESET_ALL}\n")
 
-    # ─── Step 1: Choose cloud provider ────────────────────────────────────────
     remotes = get_rclone_remotes()
-    provider_options = []
+    if not remotes:
+        print(f"  {Fore.RED}✗ No cloud storage configured in rclone.{Style.RESET_ALL}")
+        print(f"  {Fore.YELLOW}  Please run 'rclone config' first to connect your Google Drive.{Style.RESET_ALL}\n")
+        sys.exit(1)
 
-    # Dynamically build from configured remotes
-    provider_map = {
-        "gdrive": ("Google Drive", "Fast uploads with custom OAuth"),
-        "s3": ("Amazon S3", "AWS S3 compatible storage"),
-        "azure": ("Azure Blob", "Microsoft Azure storage"),
-        "dropbox": ("Dropbox", "Dropbox cloud storage"),
-        "spaces": ("DigitalOcean Spaces", "S3-compatible object storage"),
-        "supabase": ("Supabase Storage", "Postgres-backed storage"),
-    }
+    # ─── Step 1: Remote Selection (auto if only 1 configured) ─────────────────
+    if len(remotes) == 1:
+        remote = remotes[0]
+        provider = "gdrive" if "gdrive" in remote.lower() else "generic"
+        remote_display = "Google Drive" if "gdrive" in remote.lower() else remote.rstrip(':')
+        print(f"  {Fore.GREEN}✓ Target Cloud : {Fore.WHITE}{remote_display} ({remote}){Style.RESET_ALL}\n")
+    else:
+        # Multiple configured remotes - show ONLY the configured ones!
+        options = [
+            {"label": r, "value": "gdrive" if "gdrive" in r.lower() else "generic", "remote": r}
+            for r in remotes
+        ]
+        chosen = _prompt_choice("Select Cloud Storage", options)
+        remote = chosen["remote"]
+        provider = chosen["value"]
+        print()
 
-    # Show configured remotes first
-    seen_providers = set()
-    for remote in remotes:
-        remote_name = remote.rstrip(":")
-        # Try to match remote to a known provider
-        for prov_key, (prov_label, prov_desc) in provider_map.items():
-            if prov_key in remote_name.lower():
-                provider_options.append({
-                    "label": f"{prov_label} ({remote})",
-                    "value": prov_key,
-                    "remote": remote,
-                    "desc": f"✓ Configured — {prov_desc}",
-                })
-                seen_providers.add(prov_key)
-                break
-        else:
-            # Unknown remote type — still show it
-            provider_options.append({
-                "label": f"{remote_name} ({remote})",
-                "value": "gdrive",
-                "remote": remote,
-                "desc": "✓ Configured remote",
-            })
-
-    # Add unconfigured providers
-    for prov_key, (prov_label, prov_desc) in provider_map.items():
-        if prov_key not in seen_providers:
-            provider_options.append({
-                "label": prov_label,
-                "value": prov_key,
-                "remote": f"{prov_key}:",
-                "desc": f"Not configured — run 'rclone config'",
-            })
-
-    chosen_provider = _prompt_choice("Select Cloud Provider", provider_options)
-    provider = chosen_provider["value"]
-    remote = chosen_provider["remote"]
-
-    # ─── Step 2: Source file/folder ───────────────────────────────────────────
-    print()
+    # ─── Step 2: Source File or Folder ───────────────────────────────────────
     while True:
-        source = _prompt_input("Enter file or folder path")
-        if not source:
+        source_raw = input(f"  {Fore.CYAN}→ Enter file or folder path{Style.RESET_ALL}: ").strip()
+        if not source_raw:
             print(f"  {Fore.RED}  Path cannot be empty{Style.RESET_ALL}")
             continue
-        # Strip surrounding quotes
-        source = source.strip('"').strip("'")
+        source = source_raw.strip('"').strip("'")
         if os.path.exists(source):
             if os.path.isdir(source):
-                file_count = sum(1 for f in os.scandir(source) if f.is_file())
-                print(f"  {Fore.GREEN}  ✓ Folder found — {file_count} file(s){Style.RESET_ALL}")
+                count = sum(1 for f in os.scandir(source) if f.is_file())
+                print(f"  {Fore.GREEN}  ✓ Folder verified — {count} file(s){Style.RESET_ALL}\n")
             else:
                 size = os.path.getsize(source)
-                print(f"  {Fore.GREEN}  ✓ File found — {format_size(size)}{Style.RESET_ALL}")
+                print(f"  {Fore.GREEN}  ✓ File verified — {format_size(size)}{Style.RESET_ALL}\n")
             break
         else:
-            print(f"  {Fore.RED}  ✗ Path not found: {source}{Style.RESET_ALL}")
-            print(f"  {Fore.YELLOW}    Tip: Drag & drop the file into the terminal, or paste the full path{Style.RESET_ALL}")
+            print(f"  {Fore.RED}  ✗ File or folder not found: {source}{Style.RESET_ALL}")
+            print(f"  {Fore.YELLOW}    Tip: You can drag & drop the file directly into this terminal window.{Style.RESET_ALL}")
 
-    # ─── Step 3: Destination path ─────────────────────────────────────────────
-    print()
-    default_dest = f"{remote}/Backup/"
-    destination = _prompt_input("Enter destination path on cloud", default_dest)
-    # Ensure remote prefix
-    if ":" not in destination:
-        destination = f"{remote}{destination}"
+    # ─── Step 3: Destination Folder on Cloud ──────────────────────────────────
+    dest_input = input(f"  {Fore.CYAN}→ Enter folder name on cloud {Fore.LIGHTBLACK_EX}[Backup]{Style.RESET_ALL}: ").strip()
+    dest_input = dest_input.strip('"').strip("'")
+    if not dest_input:
+        dest_input = "Backup"
 
-    # ─── Step 4: Compression preference ───────────────────────────────────────
-    compress_options = [
-        {"label": "Smart (auto-detect)", "value": "smart", "desc": "Compress only if beneficial"},
-        {"label": "No compression", "value": "none", "desc": "Upload file as-is (original format)"},
-        {"label": "Force compress", "value": "force", "desc": f"Always compress with {get_compressor_name()}"},
-    ]
-    chosen_compress = _prompt_choice("Compression Mode", compress_options)
+    # Normalize destination (handles Z:\Movie, "Z:\Movie", Movie, gdrive:/Movie)
+    destination = normalize_destination(dest_input, default_remote=remote)
+    print(f"  {Fore.GREEN}  ✓ Target location: {Fore.WHITE}{destination}{Style.RESET_ALL}\n")
 
-    # ─── Step 5: Advanced options ─────────────────────────────────────────────
-    threads = None
-    max_bw = None
-    verbose = False
-
-    show_advanced = _prompt_yes_no("Configure advanced options?", default=False)
-    if show_advanced:
-        print()
-        raw_threads = _prompt_input("Upload threads", "auto")
-        if raw_threads != "auto":
-            try:
-                threads = int(raw_threads)
-            except ValueError:
-                pass
-
-        raw_bw = _prompt_input("Bandwidth limit (e.g. 50MB, or 'none')", "none")
-        if raw_bw.lower() != "none":
-            try:
-                max_bw = parse_size(raw_bw)
-            except Exception:
-                pass
-
-        verbose = _prompt_yes_no("Enable verbose output?", default=False)
-
-    # ─── Confirmation ─────────────────────────────────────────────────────────
-    print(f"\n  {Fore.CYAN}{'═' * 50}")
-    print(f"  {Fore.WHITE}  Upload Summary")
-    print(f"  {Fore.CYAN}{'═' * 50}")
-    print(f"  {Fore.WHITE}  Source      : {source}")
-    print(f"  {Fore.WHITE}  Destination : {destination}")
-    print(f"  {Fore.WHITE}  Provider    : {provider}")
-    print(f"  {Fore.WHITE}  Compression : {chosen_compress['label']}")
-    if threads:
-        print(f"  {Fore.WHITE}  Threads     : {threads}")
-    if max_bw:
-        print(f"  {Fore.WHITE}  Bandwidth   : {format_size(max_bw)}/s")
-    print(f"  {Fore.CYAN}{'═' * 50}")
-
-    if not _prompt_yes_no("Start upload?", default=True):
-        print(f"\n  {Fore.YELLOW}Upload cancelled.{Style.RESET_ALL}\n")
+    # ─── Step 4: Simple Confirmation ──────────────────────────────────────────
+    confirm = input(f"  {Fore.CYAN}→ Start transfer now? {Fore.LIGHTBLACK_EX}[Y/n]{Style.RESET_ALL}: ").strip().lower()
+    if confirm in ("n", "no"):
+        print(f"\n  {Fore.YELLOW}Transfer cancelled.{Style.RESET_ALL}\n")
         sys.exit(0)
 
-    # ─── Build config and run ─────────────────────────────────────────────────
-    no_compress = chosen_compress["value"] == "none"
-
-    overrides = {
-        "provider": provider,
-        "verbose": verbose,
-        "compression": not no_compress,
-        "dedup": True,
-    }
-    if threads is not None:
-        overrides["rclone_transfers"] = threads
-    if max_bw is not None and max_bw > 0:
-        overrides["max_bandwidth"] = max_bw
-
-    config = UploadConfig(**{k: v for k, v in overrides.items() if v is not None})
+    # By default, do NOT compress — send original file as-is!
+    config = UploadConfig(
+        provider=provider,
+        compression=False,
+        dedup=True,
+    )
     quota = QuotaTracker(provider=provider)
 
     print()

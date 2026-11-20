@@ -128,3 +128,32 @@ class TestRcloneChecks:
     def test_get_rclone_remotes_returns_list(self):
         result = get_rclone_remotes()
         assert isinstance(result, list)
+
+
+
+class TestNormalizeDestination:
+    def test_empty_destination_defaults(self):
+        from cloudboost.transport import normalize_destination
+        assert normalize_destination("", default_remote="gdrive:") == "gdrive:/Backup/"
+
+    def test_folder_name_prepends_remote(self):
+        from cloudboost.transport import normalize_destination
+        assert normalize_destination("Movie", default_remote="gdrive:") == "gdrive:/Movie"
+
+    def test_folder_with_quotes(self):
+        from cloudboost.transport import normalize_destination
+        assert normalize_destination('"Movie"', default_remote="gdrive:") == "gdrive:/Movie"
+
+    def test_remote_path_preserved(self):
+        from cloudboost.transport import normalize_destination
+        assert normalize_destination("gdrive:/Backup/", default_remote="gdrive:") == "gdrive:/Backup/"
+
+    def test_remote_path_with_quotes_stripped(self):
+        from cloudboost.transport import normalize_destination
+        assert normalize_destination('"gdrive:/Backup/"', default_remote="gdrive:") == "gdrive:/Backup/"
+
+    def test_windows_drive_letter_destination(self):
+        from cloudboost.transport import normalize_destination
+        res = normalize_destination(r'"Z:\Movie"', default_remote="gdrive:")
+        assert "gdrive:" in res
+        assert "Movie" in res

@@ -31,6 +31,7 @@ import {
   uploadWithProgress,
   detectRcloneMount,
   serverSideCopy,
+  normalizeDestination,
   QuotaTracker,
 } from './transport.js';
 import {
@@ -228,7 +229,8 @@ export async function uploadFile(filepath, destination, config = null, quota = n
   ensureDirs();
 
   // ─── Validate ──────────────────────────────────────────────────────────────
-  filepath = path.resolve(filepath);
+  filepath = path.resolve(String(filepath).trim().replace(/^['"]|['"]$/g, ''));
+  destination = await normalizeDestination(destination, config?.provider ? `${config.provider}:` : 'gdrive:');
 
   if (!fs.existsSync(filepath)) {
     console.error(chalk.red(`✗ File not found: ${filepath}`));
@@ -433,6 +435,8 @@ export async function uploadFile(filepath, destination, config = null, quota = n
 export async function uploadFolder(folderpath, destination, config = null, quota = null) {
   ensureDirs();
 
+  folderpath = String(folderpath).trim().replace(/^['"]|['"]$/g, '');
+  destination = await normalizeDestination(destination, config?.provider ? `${config.provider}:` : 'gdrive:');
   const folder = path.resolve(folderpath);
   if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
     console.error(chalk.red(`✗ Folder not found: ${folderpath}`));

@@ -457,3 +457,43 @@ def server_side_copy(
         return (False, "Server-side copy timed out")
     except Exception as e:
         return (False, str(e)[:200])
+
+
+
+def normalize_destination(destination: str, default_remote: str = "gdrive:") -> str:
+    """
+    Clean and resolve destination string to a valid rclone remote path:
+    - Strips surrounding quotes (single and double)
+    - If path points to an rclone mounted drive (e.g. Z:\\Movie or "Z:\\Movie"),
+      resolves it to remote path (e.g. gdrive:/Movie)
+    - If path has no remote prefix (e.g. 'Movie' or 'Backup' or '/Backup/'),
+      prepends default_remote
+    - Normalizes slashes to forward slashes
+    """
+    if not destination:
+        return f"{default_remote.rstrip('/')}/Backup/"
+
+    dest = destination.strip().strip('"').strip("'")
+    if not dest:
+        return f"{default_remote.rstrip('/')}/Backup/"
+
+    # Check if dest is on an rclone mount (e.g. Z:\\Movie or Z:/Movie)
+    mount_info = detect_rclone_mount(dest)
+    if mount_info:
+        remote, remote_path = mount_info
+        clean_path = remote_path.lstrip('/')
+        return f"{remote}/{clean_path}" if clean_path else remote
+
+    # Check if Windows drive format (e.g. C:\\ or Z:\\)
+    is_windows_drive = len(dest) >= 2 and dest[1] == ':' and (len(dest) == 2 or dest[2] in ('\\', '/'))
+    if is_windows_drive:
+        drive_path = dest[2:].lstrip('\\/').replace('\\', '/')
+        return f"{default_remote.rstrip('/')}/{drive_path}"
+
+    if ':' not in dest:
+        clean_path = dest.strip('/\\').replace('\\', '/')
+        return f"{default_remote.rstrip('/')}/{clean_path}"
+
+    remote_part, path_part = dest.split(':', 1)
+    clean_path = path_part.replace('\\', '/')
+    return f"{remote_part}:{clean_path}"

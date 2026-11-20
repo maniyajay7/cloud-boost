@@ -414,3 +414,41 @@ export function serverSideCopy(sourceRemote, sourcePath, destination, progressCa
     });
   });
 }
+
+
+/**
+ * Clean and resolve destination string to a valid rclone remote path.
+ */
+export async function normalizeDestination(destination, defaultRemote = 'gdrive:') {
+  if (!destination) {
+    return `${defaultRemote.replace(/\/$/, '')}/Backup/`;
+  }
+
+  let dest = destination.trim().replace(/^['"]|['"]$/g, '');
+  if (!dest) {
+    return `${defaultRemote.replace(/\/$/, '')}/Backup/`;
+  }
+
+  const mountInfo = await detectRcloneMount(dest);
+  if (mountInfo) {
+    const { remote, remotePath } = mountInfo;
+    const cleanPath = remotePath.replace(/^\//, '');
+    return cleanPath ? `${remote}/${cleanPath}` : remote;
+  }
+
+  const isWindowsDrive = dest.length >= 2 && dest[1] === ':' && (dest.length === 2 || dest[2] === '\\' || dest[2] === '/');
+  if (isWindowsDrive) {
+    const drivePath = dest.slice(2).replace(/^[\\/]+/, '').replace(/\\/g, '/');
+    return `${defaultRemote.replace(/\/$/, '')}/${drivePath}`;
+  }
+
+  if (!dest.includes(':')) {
+    const cleanPath = dest.replace(/^[\\/]+|[\\/]+$/g, '').replace(/\\/g, '/');
+    return `${defaultRemote.replace(/\/$/, '')}/${cleanPath}`;
+  }
+
+  const colonIdx = dest.indexOf(':');
+  const remotePart = dest.slice(0, colonIdx);
+  const pathPart = dest.slice(colonIdx + 1).replace(/\\/g, '/');
+  return `${remotePart}:${pathPart}`;
+}
