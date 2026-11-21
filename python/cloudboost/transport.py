@@ -108,6 +108,7 @@ def build_rclone_flags(config: UploadConfig) -> list[str]:
         "--low-level-retries=10",
         "--stats=1s",
         "--stats-one-line",
+        "--log-level=INFO",
         f"--tpslimit={config.tps_limit}",
         "--fast-list",
     ]

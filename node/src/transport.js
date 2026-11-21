@@ -108,6 +108,7 @@ export function buildRcloneFlags(config) {
     '--low-level-retries=10',
     '--stats=1s',
     '--stats-one-line',
+    '--log-level=INFO',
     `--tpslimit=${config.tpsLimit}`,
     '--fast-list',
   ];

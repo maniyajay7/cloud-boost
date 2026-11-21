@@ -529,7 +529,16 @@ def upload_folder(
         if compressed_count > 0:
             logger.info(f"  → Compressed {compressed_count} files, saved {format_size(saved_bytes)}")
 
-        upload_source = str(staging_dir)
+        # If the space saved is tiny (< 20MB) but uncompressed files are large (> 500MB),
+        # staging wastes huge amounts of C: disk space and I/O for negligible gain.
+        skip_size = sum(f.stat().st_size for f in skip_compress)
+        if saved_bytes < 20 * MB and skip_size > 500 * MB:
+            logger.info("  → Net compression savings is negligible (< 20MB) relative to folder size. Uploading directly from source to preserve C: disk space.")
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            staging_dir = None
+            upload_source = str(folder)
+        else:
+            upload_source = str(staging_dir)
     else:
         # Nothing to compress — upload folder directly
         upload_source = str(folder)
@@ -545,17 +554,16 @@ def upload_folder(
         """Parse rclone progress into animated progress bar."""
         progress_bar.update_from_rclone(line)
 
-    success, error = upload_with_progress(upload_source, destination, config, quota, folder_progress_cb)
-    if success:
-        progress_bar.complete()
-    else:
-        progress_bar.fail()
-
-    elapsed = time.monotonic() - upload_start
-
-    # ─── Cleanup staging ──────────────────────────────────────────────────────
-    if staging_dir and staging_dir.exists():
-        shutil.rmtree(staging_dir, ignore_errors=True)
+    try:
+        success, error = upload_with_progress(upload_source, destination, config, quota, folder_progress_cb)
+        if success:
+            progress_bar.complete()
+        else:
+            progress_bar.fail()
+    finally:
+        # ─── Always cleanup staging even on abort/Ctrl+C ──────────────────────
+        if staging_dir and staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     # ─── Summary ──────────────────────────────────────────────────────────────
     print(f"\n{Fore.CYAN}{SEPARATOR}")
